@@ -1,8 +1,11 @@
 import asyncio
 import logging
 import os
-import sqlite3
-import aiosqlite
+
+from dotenv import load_dotenv
+
+load_dotenv()  # до import db: DB_FILE читается из окружения
+
 import telebot
 from telebot.async_telebot import AsyncTeleBot
 from telebot.asyncio_storage import StateMemoryStorage
@@ -13,44 +16,22 @@ from telebot.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    ReplyKeyboardRemove
 )
 
-# =====================================================================
-# КОНФИГУРАЦИЯ БОТА И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
-# =====================================================================
-def load_env(env_path: str = ".env"):
-    """Загрузка конфигурации из .env файла."""
-    if not os.path.exists(env_path):
-        return
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(env_path)
-    except ImportError:
-        # Fallback парсер .env без сторонних зависимостей
-        with open(env_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, val = line.split("=", 1)
-                key = key.strip()
-                val = val.strip().strip("'\"")
-                if key and key not in os.environ:
-                    os.environ[key] = val
+import db
+from db import ROLE_WORKER, ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN, MANAGEMENT_ROLES
 
-load_env()
-
+# =====================================================================
+# КОНФИГУРАЦИЯ БОТА
+# =====================================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FIRST_SUPERADMIN_ID = int(os.getenv("FIRST_SUPERADMIN_ID", "8401341747"))
-DB_FILE = os.getenv("DB_FILE", "bot_data.db")
 
-# Настройки логирования
+# Логи — в консоль и в файл
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    filename="bot.log",
-    filemode="a"
+    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
 
@@ -59,11 +40,6 @@ storage = StateMemoryStorage()
 bot = AsyncTeleBot(BOT_TOKEN, state_storage=storage)
 
 # Названия ролей и филиалов
-ROLE_WORKER = "worker"
-ROLE_MANAGER = "manager"
-ROLE_BRANCH_ADMIN = "branch_admin"
-ROLE_SUPERADMIN = "superadmin"
-
 ROLE_NAMES = {
     ROLE_WORKER: "Работник",
     ROLE_MANAGER: "Менеджер",
@@ -97,131 +73,14 @@ class AdminBroadcastState(StatesGroup):
     message_text = State()
 
 # =====================================================================
-# ИНИЦИАЛИЗАЦИЯ И РАБОТА С БД (SQLite)
+# ПРОВЕРКА РОЛИ
 # =====================================================================
-async def init_db():
-    """Создание таблиц базы данных и регистрация первого суперадмина."""
-    async with aiosqlite.connect(DB_FILE) as db:
-        # Таблица пользователей
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                full_name TEXT NOT NULL,
-                branch TEXT NOT NULL,
-                position TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'worker'
-            )
-        """)
-        # Таблица расписания
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS schedules (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                date_str TEXT NOT NULL,
-                shift_time TEXT NOT NULL,
-                FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            )
-        """)
-        # Таблица запросов на изменение расписания
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS schedule_requests (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                date_str TEXT NOT NULL,
-                desired_time TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'PENDING',
-                FOREIGN KEY(user_id) REFERENCES users(telegram_id)
-            )
-        """)
-        # Настройки системы (пауза бота)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS system_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-        """)
-        
-        # Установка состояния паузы по умолчанию
-        await db.execute(
-            "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('is_paused', '0')"
-        )
-        
-        # Проверка и добавление первого суперадмина при условии, что ID заполнен
-        if FIRST_SUPERADMIN_ID and FIRST_SUPERADMIN_ID != 123456789:
-            async with db.execute("SELECT role FROM users WHERE telegram_id = ?", (FIRST_SUPERADMIN_ID,)) as cursor:
-                user = await cursor.fetchone()
-                if user:
-                    await db.execute("UPDATE users SET role = ? WHERE telegram_id = ?", (ROLE_SUPERADMIN, FIRST_SUPERADMIN_ID))
-                else:
-                    await db.execute(
-                        "INSERT INTO users (telegram_id, full_name, branch, position, role) VALUES (?, ?, ?, ?, ?)",
-                        (FIRST_SUPERADMIN_ID, "Главный Администратор", "Гугл", "Суперадмин", ROLE_SUPERADMIN)
-                    )
-        await db.commit()
-
-async def get_user(telegram_id: int):
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
-            return await cursor.fetchone()
-
-async def add_user(telegram_id: int, full_name: str, branch: str, position: str, role: str = ROLE_WORKER):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO users (telegram_id, full_name, branch, position, role) VALUES (?, ?, ?, ?, ?)",
-            (telegram_id, full_name, branch, position, role)
-        )
-        await db.commit()
-
-async def update_user_role(telegram_id: int, role: str):
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE users SET role = ? WHERE telegram_id = ?", (role, telegram_id))
-        await db.commit()
-
-async def count_superadmins() -> int:
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT COUNT(*) FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
-            res = await cursor.fetchone()
-            return res[0] if res else 0
-
-async def get_all_users():
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users") as cursor:
-            return await cursor.fetchall()
-
-async def get_branch_users(branch: str):
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE branch = ?", (branch,)) as cursor:
-            return await cursor.fetchall()
-
-async def get_managers_and_admins(branch: str):
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?)",
-            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN)
-        ) as cursor:
-            return await cursor.fetchall()
-
-async def get_superadmins():
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
-            return await cursor.fetchall()
-
-async def is_bot_paused() -> bool:
-    async with aiosqlite.connect(DB_FILE) as db:
-        async with db.execute("SELECT value FROM system_settings WHERE key = 'is_paused'") as cursor:
-            res = await cursor.fetchone()
-            return res[0] == '1' if res else False
-
-async def set_bot_paused(paused: bool):
-    val = '1' if paused else '0'
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute("UPDATE system_settings SET value = ? WHERE key = 'is_paused'", (val,))
-        await db.commit()
+async def get_user_with_role(user_id: int, roles):
+    """Пользователь из БД, если у него одна из ролей roles, иначе None."""
+    user = await db.get_user(user_id)
+    if user and user['role'] in roles:
+        return user
+    return None
 
 # =====================================================================
 # КЛАВИАТУРЫ И ИНТЕРФЕЙС
@@ -232,7 +91,7 @@ def get_main_keyboard(role: str) -> ReplyKeyboardMarkup:
     markup.add(KeyboardButton("✏️ Запросить изменение расписания"))
     markup.add(KeyboardButton("👤 Мой профиль"))
     
-    if role in [ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN]:
+    if role in MANAGEMENT_ROLES:
         markup.add(KeyboardButton("🏢 Расписание филиала"))
         markup.add(KeyboardButton("📥 Запросы на изменение"))
         markup.add(KeyboardButton("🛠 Изменить расписание сотрудника"))
@@ -265,8 +124,8 @@ def get_roles_keyboard(target_user_id: int) -> InlineKeyboardMarkup:
 # =====================================================================
 async def check_pause(message_or_call) -> bool:
     user_id = message_or_call.from_user.id
-    user = await get_user(user_id)
-    paused = await is_bot_paused()
+    user = await db.get_user(user_id)
+    paused = await db.is_bot_paused()
     # Log pause check details
     logger.info("check_pause: user_id=%s, paused=%s, role=%s", user_id, paused, user['role'] if user else None)
     # Суперадмин может взаимодействовать с ботом даже на паузе
@@ -287,7 +146,7 @@ async def check_pause(message_or_call) -> bool:
 async def cmd_cancel(message: telebot.types.Message):
     """Сброс любого текущего состояния FSM и возврат в главное меню."""
     current_state = await bot.get_state(message.from_user.id, message.chat.id)
-    user = await get_user(message.from_user.id)
+    user = await db.get_user(message.from_user.id)
     role = user['role'] if user else ROLE_WORKER
     
     if current_state is not None:
@@ -324,7 +183,7 @@ async def cmd_help(message: telebot.types.Message):
     if await check_pause(message):
         return
         
-    user = await get_user(message.from_user.id)
+    user = await db.get_user(message.from_user.id)
     role = user['role'] if user else ROLE_WORKER
     role_title = ROLE_NAMES.get(role, "Пользователь")
     
@@ -341,7 +200,7 @@ async def cmd_help(message: telebot.types.Message):
         "• <b>👤 Мой профиль</b> — просмотр ФИО, филиала, должности и роли\n"
     )
     
-    if role in [ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN]:
+    if role in MANAGEMENT_ROLES:
         text += (
             "\n<b>Возможности руководства:</b>\n"
             "• <b>🏢 Расписание филиала</b> — просмотр смен всех сотрудников филиала\n"
@@ -366,7 +225,7 @@ async def cmd_profile(message: telebot.types.Message):
     if await check_pause(message):
         return
         
-    user = await get_user(message.from_user.id)
+    user = await db.get_user(message.from_user.id)
     if not user:
         await bot.send_message(
             message.chat.id,
@@ -392,7 +251,7 @@ async def cmd_start(message: telebot.types.Message):
     logger.info("cmd_start invoked for user_id=%s", message.from_user.id)
     if await check_pause(message):
         return
-    user = await get_user(message.from_user.id)
+    user = await db.get_user(message.from_user.id)
     if user:
         logger.info("Existing user %s found, sending welcome back", user['telegram_id'])
         await bot.send_message(
@@ -452,7 +311,7 @@ async def process_position(message: telebot.types.Message):
     # По умолчанию — Работник (если не первый суперадмин)
     role = ROLE_SUPERADMIN if user_id == FIRST_SUPERADMIN_ID else ROLE_WORKER
     
-    await add_user(user_id, full_name, branch, position, role)
+    await db.add_user(user_id, full_name, branch, position, role)
     await bot.delete_state(user_id, message.chat.id)
     
     await bot.send_message(
@@ -462,7 +321,7 @@ async def process_position(message: telebot.types.Message):
     )
     
     # Уведомление Суперадминам о новой регистрации
-    superadmins = await get_superadmins()
+    superadmins = await db.get_superadmins()
     for admin in superadmins:
         try:
             await bot.send_message(
@@ -486,12 +345,7 @@ async def view_my_schedule(message: telebot.types.Message):
     if await check_pause(message):
         return
         
-    user_id = message.from_user.id
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT date_str, shift_time FROM schedules WHERE user_id = ? ORDER BY date_str", (user_id,)) as cursor:
-            schedules = await cursor.fetchall()
-            
+    schedules = await db.get_user_schedule(message.from_user.id)
     if not schedules:
         await bot.send_message(message.chat.id, "У вас пока нет назначенного расписания.")
         return
@@ -537,21 +391,13 @@ async def process_req_time(message: telebot.types.Message):
         date_str = data['date_str']
         
     await bot.delete_state(user_id, message.chat.id)
-    user = await get_user(user_id)
+    user = await db.get_user(user_id)
     
-    # Сохранение запроса в БД
-    async with aiosqlite.connect(DB_FILE) as db:
-        cursor = await db.execute(
-            "INSERT INTO schedule_requests (user_id, date_str, desired_time, status) VALUES (?, ?, ?, 'PENDING')",
-            (user_id, date_str, desired_time)
-        )
-        req_id = cursor.lastrowid
-        await db.commit()
-        
+    req_id = await db.create_request(user_id, date_str, desired_time)
     await bot.send_message(message.chat.id, "✅ Ваш запрос успешно отправлен руководству филиала!")
     
     # Уведомление Менеджеров и Управляющих филиала
-    managers = await get_managers_and_admins(user['branch'])
+    managers = await db.get_managers_and_admins(user['branch'])
     markup = InlineKeyboardMarkup()
     markup.add(
         InlineKeyboardButton("✅ Принять", callback_data=f"app_req:{req_id}"),
@@ -581,28 +427,24 @@ async def view_branch_schedule(message: telebot.types.Message):
     if await check_pause(message):
         return
         
-    user = await get_user(message.from_user.id)
-    if not user or user['role'] not in [ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN]:
+    user = await get_user_with_role(message.from_user.id, MANAGEMENT_ROLES)
+    if not user:
         return
         
-    employees = await get_branch_users(user['branch'])
+    employees = await db.get_branch_schedule(user['branch'])
     if not employees:
         await bot.send_message(message.chat.id, "В вашем филиале нет сотрудников.")
         return
         
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        text = f"🏢 <b>Расписание филиала «{user['branch']}»:</b>\n\n"
-        for emp in employees:
-            text += f"👤 <b>{emp['full_name']}</b> (<i>{emp['position']}</i>):\n"
-            async with db.execute("SELECT date_str, shift_time FROM schedules WHERE user_id = ?", (emp['telegram_id'],)) as cursor:
-                schedules = await cursor.fetchall()
-                if schedules:
-                    for s in schedules:
-                        text += f"   • {s['date_str']}: <code>{s['shift_time']}</code>\n"
-                else:
-                    text += "   • <i>Расписание отсутствует</i>\n"
-            text += "\n"
+    text = f"🏢 <b>Расписание филиала «{user['branch']}»:</b>\n\n"
+    for emp in employees:
+        text += f"👤 <b>{emp['full_name']}</b> (<i>{emp['position']}</i>):\n"
+        if emp['shifts']:
+            for date_str, shift_time in emp['shifts']:
+                text += f"   • {date_str}: <code>{shift_time}</code>\n"
+        else:
+            text += "   • <i>Расписание отсутствует</i>\n"
+        text += "\n"
             
     await bot.send_message(message.chat.id, text, parse_mode="HTML")
 
@@ -611,20 +453,11 @@ async def view_pending_requests(message: telebot.types.Message):
     if await check_pause(message):
         return
         
-    user = await get_user(message.from_user.id)
-    if not user or user['role'] not in [ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN]:
+    user = await get_user_with_role(message.from_user.id, MANAGEMENT_ROLES)
+    if not user:
         return
         
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("""
-            SELECT sr.id, sr.user_id, sr.date_str, sr.desired_time, u.full_name, u.position
-            FROM schedule_requests sr
-            JOIN users u ON sr.user_id = u.telegram_id
-            WHERE u.branch = ? AND sr.status = 'PENDING'
-        """, (user['branch'],)) as cursor:
-            requests = await cursor.fetchall()
-            
+    requests = await db.get_pending_requests(user['branch'])
     if not requests:
         await bot.send_message(message.chat.id, "Активных запросов нет.")
         return
@@ -653,31 +486,17 @@ async def process_request_decision(call: telebot.types.CallbackQuery):
     action, req_id_str = call.data.split(':')
     req_id = int(req_id_str)
     
-    async with aiosqlite.connect(DB_FILE) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM schedule_requests WHERE id = ?", (req_id,)) as cursor:
-            req = await cursor.fetchone()
-            
-        if not req or req['status'] != 'PENDING':
-            await bot.answer_callback_query(call.id, "Запрос уже обработан.", show_alert=True)
-            return
-            
-        new_status = 'APPROVED' if action == 'app_req' else 'REJECTED'
-        await db.execute("UPDATE schedule_requests SET status = ? WHERE id = ?", (new_status, req_id))
-        
-        if new_status == 'APPROVED':
-            # Обновление или добавление расписания
-            await db.execute(
-                "INSERT OR REPLACE INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?)",
-                (req['user_id'], req['date_str'], req['desired_time'])
-            )
-        await db.commit()
+    approve = action == 'app_req'
+    req = await db.decide_request(req_id, approve)
+    if not req:
+        await bot.answer_callback_query(call.id, "Запрос уже обработан.", show_alert=True)
+        return
         
     await bot.answer_callback_query(call.id, "Решение сохранено!")
     await bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
     
     # Уведомление работника
-    if new_status == 'APPROVED':
+    if approve:
         msg_text = f"🔔 Ваше расписание на [{req['date_str']}] было изменено: новое время [{req['desired_time']}]."
     else:
         msg_text = f"❌ Ваш запрос на изменение расписания на [{req['date_str']}] был отклонен."
@@ -692,11 +511,11 @@ async def start_edit_schedule(message: telebot.types.Message):
     if await check_pause(message):
         return
         
-    user = await get_user(message.from_user.id)
-    if not user or user['role'] not in [ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN]:
+    user = await get_user_with_role(message.from_user.id, MANAGEMENT_ROLES)
+    if not user:
         return
         
-    employees = await get_branch_users(user['branch'])
+    employees = await db.get_branch_users(user['branch'])
     if not employees:
         await bot.send_message(message.chat.id, "Нет сотрудников для редактирования.")
         return
@@ -745,13 +564,7 @@ async def process_edit_time(message: telebot.types.Message):
         
     await bot.delete_state(user_id, message.chat.id)
     
-    async with aiosqlite.connect(DB_FILE) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?)",
-            (target_id, date_str, shift_time)
-        )
-        await db.commit()
-        
+    await db.set_shift(target_id, date_str, shift_time)
     await bot.send_message(message.chat.id, "✅ Расписание сотрудника успешно обновлено!")
     
     # Личное уведомление сотруднику
@@ -768,8 +581,7 @@ async def process_edit_time(message: telebot.types.Message):
 # =====================================================================
 @bot.message_handler(func=lambda m: m.text == "👤 Назначить роль")
 async def start_assign_role(message: telebot.types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or user['role'] != ROLE_SUPERADMIN:
+    if not await get_user_with_role(message.from_user.id, (ROLE_SUPERADMIN,)):
         return
         
     await bot.send_message(
@@ -787,7 +599,7 @@ async def process_assign_role_id(message: telebot.types.Message):
         return
         
     target_id = int(message.text.strip())
-    target_user = await get_user(target_id)
+    target_user = await db.get_user(target_id)
     
     if not target_user:
         await bot.send_message(message.chat.id, "⚠️ Пользователь с таким ID не найден в базе данных.")
@@ -809,13 +621,13 @@ async def process_role_callback(call: telebot.types.CallbackQuery):
     
     # Жесткое ограничение на количество Администраторов (максимум 2)
     if new_role == ROLE_SUPERADMIN:
-        current_superadmins = await count_superadmins()
-        target_user = await get_user(target_id)
+        current_superadmins = await db.count_superadmins()
+        target_user = await db.get_user(target_id)
         if current_superadmins >= 2 and (not target_user or target_user['role'] != ROLE_SUPERADMIN):
             await bot.answer_callback_query(call.id, "❌ Достигнут лимит: в системе может быть максимум 2 Администратора!", show_alert=True)
             return
             
-    await update_user_role(target_id, new_role)
+    await db.update_user_role(target_id, new_role)
     await bot.answer_callback_query(call.id, "Роль успешно изменена!")
     await bot.send_message(
         call.message.chat.id,
@@ -835,8 +647,7 @@ async def process_role_callback(call: telebot.types.CallbackQuery):
 
 @bot.message_handler(func=lambda m: m.text == "📢 Глобальная рассылка")
 async def start_broadcast(message: telebot.types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or user['role'] != ROLE_SUPERADMIN:
+    if not await get_user_with_role(message.from_user.id, (ROLE_SUPERADMIN,)):
         return
         
     await bot.send_message(
@@ -852,7 +663,7 @@ async def process_broadcast_text(message: telebot.types.Message):
     text = message.text
     await bot.delete_state(message.from_user.id, message.chat.id)
     
-    users = await get_all_users()
+    users = await db.get_all_users()
     count = 0
     for u in users:
         try:
@@ -865,15 +676,14 @@ async def process_broadcast_text(message: telebot.types.Message):
 
 @bot.message_handler(func=lambda m: m.text == "⏸ Приостановить/Запустить бота")
 async def toggle_bot_pause(message: telebot.types.Message):
-    user = await get_user(message.from_user.id)
-    if not user or user['role'] != ROLE_SUPERADMIN:
+    if not await get_user_with_role(message.from_user.id, (ROLE_SUPERADMIN,)):
         return
         
-    current_state = await is_bot_paused()
+    current_state = await db.is_bot_paused()
     new_state = not current_state
-    await set_bot_paused(new_state)
+    await db.set_bot_paused(new_state)
     
-    users = await get_all_users()
+    users = await db.get_all_users()
     if new_state:
         status_msg = "⛔️ <b>Бот временно остановлен администратором.</b>"
     else:
@@ -893,7 +703,7 @@ async def toggle_bot_pause(message: telebot.types.Message):
 # =====================================================================
 async def main():
     # Инициализация структуры БД
-    await init_db()
+    await db.init_db(FIRST_SUPERADMIN_ID)
     
     # Добавление фильтров состояний
     bot.add_custom_filter(asyncio_filters.StateFilter(bot))
