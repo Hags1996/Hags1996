@@ -1,7 +1,10 @@
 """Работа с базой данных SQLite (aiosqlite). Весь SQL бота живёт здесь."""
 import os
+from datetime import date
 
 import aiosqlite
+
+from shifts import parse_date
 
 DB_FILE = os.getenv("DB_FILE", "bot_data.db")
 
@@ -57,6 +60,7 @@ async def init_db(first_superadmin_id: int):
         await db.execute(
             "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('is_paused', '0')"
         )
+        await _migrate(db)
 
         if first_superadmin_id:
             async with db.execute("SELECT role FROM users WHERE telegram_id = ?", (first_superadmin_id,)) as cursor:
@@ -69,6 +73,36 @@ async def init_db(first_superadmin_id: int):
                     (first_superadmin_id, "Главный Администратор", "Гугл", "Суперадмин", ROLE_SUPERADMIN)
                 )
         await db.commit()
+
+
+async def _migrate(db):
+    """Обновление схемы старой базы. Версия хранится в PRAGMA user_version."""
+    async with db.execute("PRAGMA user_version") as cursor:
+        version = (await cursor.fetchone())[0]
+
+    if version < 1:
+        # 1. Даты «ДД.ММ» → «ГГГГ-ММ-ДД». Нераспознанные значения не трогаем.
+        today = date.today()
+        for select_sql, update_sql in (
+            ("SELECT id, date_str FROM schedules", "UPDATE schedules SET date_str = ? WHERE id = ?"),
+            ("SELECT id, date_str FROM schedule_requests", "UPDATE schedule_requests SET date_str = ? WHERE id = ?"),
+        ):
+            async with db.execute(select_sql) as cursor:
+                rows = await cursor.fetchall()
+            for row_id, date_str in rows:
+                iso = parse_date(date_str, today)
+                if iso and iso != date_str:
+                    await db.execute(update_sql, (iso, row_id))
+        # 2. Одна смена на сотрудника в день: оставляем последнюю запись
+        await db.execute("""
+            DELETE FROM schedules WHERE id NOT IN (
+                SELECT MAX(id) FROM schedules GROUP BY user_id, date_str
+            )
+        """)
+        await db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_user_date ON schedules(user_id, date_str)"
+        )
+        await db.execute("PRAGMA user_version = 1")
 
 
 # ---------------------------------------------------------------------
@@ -155,7 +189,7 @@ async def get_branch_schedule(branch: str):
             FROM users u
             LEFT JOIN schedules s ON s.user_id = u.telegram_id
             WHERE u.branch = ?
-            ORDER BY u.telegram_id, s.id
+            ORDER BY u.telegram_id, s.date_str
         """, (branch,)) as cursor:
             rows = await cursor.fetchall()
 
@@ -170,7 +204,8 @@ async def get_branch_schedule(branch: str):
 async def set_shift(user_id: int, date_str: str, shift_time: str):
     async with _connect() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?)",
+            "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
+            "ON CONFLICT(user_id, date_str) DO UPDATE SET shift_time = excluded.shift_time",
             (user_id, date_str, shift_time)
         )
         await db.commit()
@@ -226,7 +261,8 @@ async def decide_request(req_id: int, approve: bool):
         await db.execute("UPDATE schedule_requests SET status = ? WHERE id = ?", (new_status, req_id))
         if approve:
             await db.execute(
-                "INSERT OR REPLACE INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?)",
+                "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id, date_str) DO UPDATE SET shift_time = excluded.shift_time",
                 (req['user_id'], req['date_str'], req['desired_time'])
             )
         await db.commit()

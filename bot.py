@@ -21,6 +21,7 @@ from telebot.types import (
 )
 
 import db
+from shifts import parse_date, parse_shift, format_date
 from db import ROLE_WORKER, ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN, MANAGEMENT_ROLES
 
 # =====================================================================
@@ -96,6 +97,16 @@ def can_manage_branch(manager, branch: str) -> bool:
 def esc(value) -> str:
     """Экранирование пользовательского текста перед вставкой в HTML-сообщение."""
     return html.escape(str(value))
+
+
+BAD_DATE_TEXT = (
+    "❗️ Не получилось распознать дату. Введите её в формате <b>ДД.ММ</b>, например <code>25.10</code>.\n\n"
+    "<i>Для отмены введите /cancel</i>"
+)
+BAD_SHIFT_TEXT = (
+    "❗️ Не получилось распознать время. Введите <code>08:00 - 20:00</code> или <code>Выходной</code>.\n\n"
+    "<i>Для отмены введите /cancel</i>"
+)
 
 # =====================================================================
 # КЛАВИАТУРЫ И ИНТЕРФЕЙС
@@ -370,7 +381,7 @@ async def view_my_schedule(message: telebot.types.Message):
         
     text = "🗓 <b>Ваше расписание:</b>\n\n"
     for s in schedules:
-        text += f"• <b>{esc(s['date_str'])}:</b> <code>{esc(s['shift_time'])}</code>\n"
+        text += f"• <b>{esc(format_date(s['date_str']))}:</b> <code>{esc(s['shift_time'])}</code>\n"
         
     await bot.send_message(message.chat.id, text, parse_mode="HTML")
 
@@ -384,7 +395,7 @@ async def start_request_schedule(message: telebot.types.Message):
         
     await bot.send_message(
         message.chat.id,
-        "📅 Введите дату, на которую хотите изменить расписание (например: 25.10 или Понедельник):\n\n"
+        "📅 Введите дату, на которую хотите изменить расписание (например: 25.10):\n\n"
         "<i>Для отмены введите /cancel</i>",
         parse_mode="HTML"
     )
@@ -392,8 +403,12 @@ async def start_request_schedule(message: telebot.types.Message):
 
 @bot.message_handler(state=RequestScheduleState.date_str)
 async def process_req_date(message: telebot.types.Message):
+    date_str = parse_date(message.text or "")
+    if not date_str:
+        await bot.send_message(message.chat.id, BAD_DATE_TEXT, parse_mode="HTML")
+        return
     async with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['date_str'] = message.text.strip()
+        data['date_str'] = date_str
         
     await bot.send_message(
         message.chat.id,
@@ -405,7 +420,10 @@ async def process_req_date(message: telebot.types.Message):
 
 @bot.message_handler(state=RequestScheduleState.desired_time)
 async def process_req_time(message: telebot.types.Message):
-    desired_time = message.text.strip()
+    desired_time = parse_shift(message.text or "")
+    if not desired_time:
+        await bot.send_message(message.chat.id, BAD_SHIFT_TEXT, parse_mode="HTML")
+        return
     user_id = message.from_user.id
     
     async with bot.retrieve_data(user_id, message.chat.id) as data:
@@ -432,7 +450,7 @@ async def process_req_time(message: telebot.types.Message):
                 f"📩 <b>Новый запрос на изменение расписания!</b>\n\n"
                 f"<b>Сотрудник:</b> {esc(user['full_name'])} ({esc(user['position'])})\n"
                 f"<b>Филиал:</b> {esc(user['branch'])}\n"
-                f"<b>Дата:</b> {esc(date_str)}\n"
+                f"<b>Дата:</b> {esc(format_date(date_str))}\n"
                 f"<b>Желаемое время:</b> {esc(desired_time)}",
                 parse_mode="HTML",
                 reply_markup=markup
@@ -462,7 +480,7 @@ async def view_branch_schedule(message: telebot.types.Message):
         text += f"👤 <b>{esc(emp['full_name'])}</b> (<i>{esc(emp['position'])}</i>):\n"
         if emp['shifts']:
             for date_str, shift_time in emp['shifts']:
-                text += f"   • {esc(date_str)}: <code>{esc(shift_time)}</code>\n"
+                text += f"   • {esc(format_date(date_str))}: <code>{esc(shift_time)}</code>\n"
         else:
             text += "   • <i>Расписание отсутствует</i>\n"
         text += "\n"
@@ -493,7 +511,7 @@ async def view_pending_requests(message: telebot.types.Message):
             message.chat.id,
             f"📋 <b>Запрос №{r['id']}</b>\n"
             f"<b>Сотрудник:</b> {esc(r['full_name'])} ({esc(r['position'])})\n"
-            f"<b>Дата:</b> {esc(r['date_str'])}\n"
+            f"<b>Дата:</b> {esc(format_date(r['date_str']))}\n"
             f"<b>Желаемое время:</b> {esc(r['desired_time'])}",
             parse_mode="HTML",
             reply_markup=markup
@@ -524,9 +542,9 @@ async def process_request_decision(call: telebot.types.CallbackQuery):
     
     # Уведомление работника
     if approve:
-        msg_text = f"🔔 Ваше расписание на [{req['date_str']}] было изменено: новое время [{req['desired_time']}]."
+        msg_text = f"🔔 Ваше расписание на [{format_date(req['date_str'])}] было изменено: новое время [{req['desired_time']}]."
     else:
-        msg_text = f"❌ Ваш запрос на изменение расписания на [{req['date_str']}] был отклонен."
+        msg_text = f"❌ Ваш запрос на изменение расписания на [{format_date(req['date_str'])}] был отклонен."
         
     try:
         await bot.send_message(req['user_id'], msg_text)
@@ -576,8 +594,12 @@ async def select_emp_to_edit(call: telebot.types.CallbackQuery):
 
 @bot.message_handler(state=EditScheduleState.date_str)
 async def process_edit_date(message: telebot.types.Message):
+    date_str = parse_date(message.text or "")
+    if not date_str:
+        await bot.send_message(message.chat.id, BAD_DATE_TEXT, parse_mode="HTML")
+        return
     async with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
-        data['date_str'] = message.text.strip()
+        data['date_str'] = date_str
         
     await bot.send_message(
         message.chat.id,
@@ -588,7 +610,10 @@ async def process_edit_date(message: telebot.types.Message):
 
 @bot.message_handler(state=EditScheduleState.shift_time)
 async def process_edit_time(message: telebot.types.Message):
-    shift_time = message.text.strip()
+    shift_time = parse_shift(message.text or "")
+    if not shift_time:
+        await bot.send_message(message.chat.id, BAD_SHIFT_TEXT, parse_mode="HTML")
+        return
     user_id = message.from_user.id
     
     async with bot.retrieve_data(user_id, message.chat.id) as data:
@@ -604,7 +629,7 @@ async def process_edit_time(message: telebot.types.Message):
     try:
         await bot.send_message(
             target_id,
-            f"🔔 Ваше расписание на [{date_str}] было изменено: новое время [{shift_time}]."
+            f"🔔 Ваше расписание на [{format_date(date_str)}] было изменено: новое время [{shift_time}]."
         )
     except Exception as e:
         logger.error(f"Не удалось отправить личное сообщение {target_id}: {e}")
