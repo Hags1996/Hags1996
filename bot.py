@@ -1,6 +1,8 @@
 import asyncio
+import html
 import logging
 import os
+import sys
 
 from dotenv import load_dotenv
 
@@ -24,8 +26,11 @@ from db import ROLE_WORKER, ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN, MA
 # =====================================================================
 # КОНФИГУРАЦИЯ БОТА
 # =====================================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-FIRST_SUPERADMIN_ID = int(os.getenv("FIRST_SUPERADMIN_ID", "8401341747"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+_first_admin = os.getenv("FIRST_SUPERADMIN_ID", "").strip()
+if not BOT_TOKEN or not _first_admin.isdigit():
+    sys.exit("Заполните BOT_TOKEN и FIRST_SUPERADMIN_ID (число) в файле .env — образец в .env.example")
+FIRST_SUPERADMIN_ID = int(_first_admin)
 
 # Логи — в консоль и в файл
 logging.basicConfig(
@@ -81,6 +86,16 @@ async def get_user_with_role(user_id: int, roles):
     if user and user['role'] in roles:
         return user
     return None
+
+
+def can_manage_branch(manager, branch: str) -> bool:
+    """Руководитель управляет своим филиалом, Администратор — любым."""
+    return manager['role'] == ROLE_SUPERADMIN or manager['branch'] == branch
+
+
+def esc(value) -> str:
+    """Экранирование пользовательского текста перед вставкой в HTML-сообщение."""
+    return html.escape(str(value))
 
 # =====================================================================
 # КЛАВИАТУРЫ И ИНТЕРФЕЙС
@@ -236,9 +251,9 @@ async def cmd_profile(message: telebot.types.Message):
     text = (
         "👤 <b>Ваш профиль в системе:</b>\n\n"
         f"🆔 <b>Telegram ID:</b> <code>{user['telegram_id']}</code>\n"
-        f"🏷 <b>ФИО:</b> {user['full_name']}\n"
-        f"🏢 <b>Филиал:</b> {user['branch']}\n"
-        f"💼 <b>Должность:</b> {user['position']}\n"
+        f"🏷 <b>ФИО:</b> {esc(user['full_name'])}\n"
+        f"🏢 <b>Филиал:</b> {esc(user['branch'])}\n"
+        f"💼 <b>Должность:</b> {esc(user['position'])}\n"
         f"🔑 <b>Роль:</b> {ROLE_NAMES.get(user['role'], user['role'])}\n"
     )
     await bot.send_message(message.chat.id, text, parse_mode="HTML")
@@ -287,7 +302,10 @@ async def process_full_name(message: telebot.types.Message):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('select_branch:'), state=RegistrationState.branch)
 async def process_branch(call: telebot.types.CallbackQuery):
-    branch = call.data.split(':')[1]
+    branch = call.data.split(':', 1)[1]
+    if branch not in BRANCHES:
+        await bot.answer_callback_query(call.id, "Такого филиала нет.", show_alert=True)
+        return
     async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
         data['branch'] = branch
         
@@ -328,9 +346,9 @@ async def process_position(message: telebot.types.Message):
                 admin['telegram_id'],
                 f"🔔 <b>Новый пользователь зарегистрирован!</b>\n\n"
                 f"<b>ID:</b> <code>{user_id}</code>\n"
-                f"<b>ФИО:</b> {full_name}\n"
-                f"<b>Филиал:</b> {branch}\n"
-                f"<b>Должность:</b> {position}",
+                f"<b>ФИО:</b> {esc(full_name)}\n"
+                f"<b>Филиал:</b> {esc(branch)}\n"
+                f"<b>Должность:</b> {esc(position)}",
                 parse_mode="HTML",
                 reply_markup=get_roles_keyboard(user_id)
             )
@@ -352,13 +370,16 @@ async def view_my_schedule(message: telebot.types.Message):
         
     text = "🗓 <b>Ваше расписание:</b>\n\n"
     for s in schedules:
-        text += f"• <b>{s['date_str']}:</b> <code>{s['shift_time']}</code>\n"
+        text += f"• <b>{esc(s['date_str'])}:</b> <code>{esc(s['shift_time'])}</code>\n"
         
     await bot.send_message(message.chat.id, text, parse_mode="HTML")
 
 @bot.message_handler(func=lambda m: m.text == "✏️ Запросить изменение расписания")
 async def start_request_schedule(message: telebot.types.Message):
     if await check_pause(message):
+        return
+    if not await db.get_user(message.from_user.id):
+        await bot.send_message(message.chat.id, "⚠️ Вы еще не зарегистрированы в системе. Нажмите /start для регистрации.")
         return
         
     await bot.send_message(
@@ -409,10 +430,10 @@ async def process_req_time(message: telebot.types.Message):
             await bot.send_message(
                 mgr['telegram_id'],
                 f"📩 <b>Новый запрос на изменение расписания!</b>\n\n"
-                f"<b>Сотрудник:</b> {user['full_name']} ({user['position']})\n"
-                f"<b>Филиал:</b> {user['branch']}\n"
-                f"<b>Дата:</b> {date_str}\n"
-                f"<b>Желаемое время:</b> {desired_time}",
+                f"<b>Сотрудник:</b> {esc(user['full_name'])} ({esc(user['position'])})\n"
+                f"<b>Филиал:</b> {esc(user['branch'])}\n"
+                f"<b>Дата:</b> {esc(date_str)}\n"
+                f"<b>Желаемое время:</b> {esc(desired_time)}",
                 parse_mode="HTML",
                 reply_markup=markup
             )
@@ -436,12 +457,12 @@ async def view_branch_schedule(message: telebot.types.Message):
         await bot.send_message(message.chat.id, "В вашем филиале нет сотрудников.")
         return
         
-    text = f"🏢 <b>Расписание филиала «{user['branch']}»:</b>\n\n"
+    text = f"🏢 <b>Расписание филиала «{esc(user['branch'])}»:</b>\n\n"
     for emp in employees:
-        text += f"👤 <b>{emp['full_name']}</b> (<i>{emp['position']}</i>):\n"
+        text += f"👤 <b>{esc(emp['full_name'])}</b> (<i>{esc(emp['position'])}</i>):\n"
         if emp['shifts']:
             for date_str, shift_time in emp['shifts']:
-                text += f"   • {date_str}: <code>{shift_time}</code>\n"
+                text += f"   • {esc(date_str)}: <code>{esc(shift_time)}</code>\n"
         else:
             text += "   • <i>Расписание отсутствует</i>\n"
         text += "\n"
@@ -471,9 +492,9 @@ async def view_pending_requests(message: telebot.types.Message):
         await bot.send_message(
             message.chat.id,
             f"📋 <b>Запрос №{r['id']}</b>\n"
-            f"<b>Сотрудник:</b> {r['full_name']} ({r['position']})\n"
-            f"<b>Дата:</b> {r['date_str']}\n"
-            f"<b>Желаемое время:</b> {r['desired_time']}",
+            f"<b>Сотрудник:</b> {esc(r['full_name'])} ({esc(r['position'])})\n"
+            f"<b>Дата:</b> {esc(r['date_str'])}\n"
+            f"<b>Желаемое время:</b> {esc(r['desired_time'])}",
             parse_mode="HTML",
             reply_markup=markup
         )
@@ -485,6 +506,12 @@ async def process_request_decision(call: telebot.types.CallbackQuery):
         
     action, req_id_str = call.data.split(':')
     req_id = int(req_id_str)
+
+    manager = await get_user_with_role(call.from_user.id, MANAGEMENT_ROLES)
+    req_branch = await db.get_request_branch(req_id)
+    if not manager or req_branch is None or not can_manage_branch(manager, req_branch):
+        await bot.answer_callback_query(call.id, "⛔️ Недостаточно прав.", show_alert=True)
+        return
     
     approve = action == 'app_req'
     req = await db.decide_request(req_id, approve)
@@ -530,6 +557,11 @@ async def start_edit_schedule(message: telebot.types.Message):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('edit_emp:'))
 async def select_emp_to_edit(call: telebot.types.CallbackQuery):
     target_id = int(call.data.split(':')[1])
+    manager = await get_user_with_role(call.from_user.id, MANAGEMENT_ROLES)
+    target = await db.get_user(target_id)
+    if not manager or not target or not can_manage_branch(manager, target['branch']):
+        await bot.answer_callback_query(call.id, "⛔️ Недостаточно прав.", show_alert=True)
+        return
     # Сначала состояние, потом данные: без состояния хранилище не сохранит data
     await bot.set_state(call.from_user.id, EditScheduleState.date_str, call.message.chat.id)
     async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
@@ -610,23 +642,33 @@ async def process_assign_role_id(message: telebot.types.Message):
     await bot.delete_state(message.from_user.id, message.chat.id)
     await bot.send_message(
         message.chat.id,
-        f"Выберите новую роль для <b>{target_user['full_name']}</b>:",
+        f"Выберите новую роль для <b>{esc(target_user['full_name'])}</b>:",
         parse_mode="HTML",
         reply_markup=get_roles_keyboard(target_id)
     )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith('set_role:'))
 async def process_role_callback(call: telebot.types.CallbackQuery):
+    if not await get_user_with_role(call.from_user.id, (ROLE_SUPERADMIN,)):
+        await bot.answer_callback_query(call.id, "⛔️ Недостаточно прав.", show_alert=True)
+        return
+
     _, target_id_str, new_role = call.data.split(':')
     target_id = int(target_id_str)
-    
+    target_user = await db.get_user(target_id)
+    if not target_user or new_role not in ROLE_NAMES:
+        await bot.answer_callback_query(call.id, "⚠️ Пользователь или роль не найдены.", show_alert=True)
+        return
+
+    superadmins = await db.count_superadmins()
     # Жесткое ограничение на количество Администраторов (максимум 2)
-    if new_role == ROLE_SUPERADMIN:
-        current_superadmins = await db.count_superadmins()
-        target_user = await db.get_user(target_id)
-        if current_superadmins >= 2 and (not target_user or target_user['role'] != ROLE_SUPERADMIN):
-            await bot.answer_callback_query(call.id, "❌ Достигнут лимит: в системе может быть максимум 2 Администратора!", show_alert=True)
-            return
+    if new_role == ROLE_SUPERADMIN and target_user['role'] != ROLE_SUPERADMIN and superadmins >= 2:
+        await bot.answer_callback_query(call.id, "❌ Достигнут лимит: в системе может быть максимум 2 Администратора!", show_alert=True)
+        return
+    # Нельзя снять последнего Администратора — иначе управлять ботом будет некому
+    if target_user['role'] == ROLE_SUPERADMIN and new_role != ROLE_SUPERADMIN and superadmins <= 1:
+        await bot.answer_callback_query(call.id, "❌ Это последний Администратор — сначала назначьте другого.", show_alert=True)
+        return
             
     await db.update_user_role(target_id, new_role)
     await bot.answer_callback_query(call.id, "Роль успешно изменена!")
@@ -668,7 +710,7 @@ async def process_broadcast_text(message: telebot.types.Message):
     count = 0
     for u in users:
         try:
-            await bot.send_message(u['telegram_id'], f"📢 <b>Объявление от администрации:</b>\n\n{text}", parse_mode="HTML")
+            await bot.send_message(u['telegram_id'], f"📢 <b>Объявление от администрации:</b>\n\n{esc(text)}", parse_mode="HTML")
             count += 1
         except Exception:
             pass

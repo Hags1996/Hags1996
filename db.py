@@ -58,7 +58,7 @@ async def init_db(first_superadmin_id: int):
             "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('is_paused', '0')"
         )
 
-        if first_superadmin_id and first_superadmin_id != 123456789:
+        if first_superadmin_id:
             async with db.execute("SELECT role FROM users WHERE telegram_id = ?", (first_superadmin_id,)) as cursor:
                 user = await cursor.fetchone()
             if user:
@@ -199,6 +199,18 @@ async def get_pending_requests(branch: str):
             WHERE u.branch = ? AND sr.status = 'PENDING'
         """, (branch,)) as cursor:
             return await cursor.fetchall()
+
+
+async def get_request_branch(req_id: int):
+    """Филиал сотрудника, подавшего заявку (None, если заявки нет)."""
+    async with _connect() as db:
+        async with db.execute("""
+            SELECT u.branch FROM schedule_requests sr
+            JOIN users u ON sr.user_id = u.telegram_id
+            WHERE sr.id = ?
+        """, (req_id,)) as cursor:
+            row = await cursor.fetchone()
+            return row[0] if row else None
 
 
 async def decide_request(req_id: int, approve: bool):
