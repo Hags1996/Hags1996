@@ -530,16 +530,17 @@ async def start_edit_schedule(message: telebot.types.Message):
 @bot.callback_query_handler(func=lambda c: c.data.startswith('edit_emp:'))
 async def select_emp_to_edit(call: telebot.types.CallbackQuery):
     target_id = int(call.data.split(':')[1])
+    # Сначала состояние, потом данные: без состояния хранилище не сохранит data
+    await bot.set_state(call.from_user.id, EditScheduleState.date_str, call.message.chat.id)
     async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
         data['target_user_id'] = target_id
-        
+
     await bot.answer_callback_query(call.id)
     await bot.send_message(
         call.message.chat.id,
         "📅 Введите дату смены (например: 26.10):\n\n<i>Для отмены введите /cancel</i>",
         parse_mode="HTML"
     )
-    await bot.set_state(call.from_user.id, EditScheduleState.date_str, call.message.chat.id)
 
 @bot.message_handler(state=EditScheduleState.date_str)
 async def process_edit_date(message: telebot.types.Message):
