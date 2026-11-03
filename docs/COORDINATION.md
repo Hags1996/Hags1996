@@ -18,13 +18,14 @@ Merge пул-реквеста, push в `main` и деплой — только �
 | Дата | Ветка | PR | Что | Итог |
 | :--- | :--- | :--- | :--- | :--- |
 | 2026-10-04 | `chore/cleanup-security` | #1 | порядок в репозитории, проверка прав, экранирование HTML, проверка ввода, тесты | влит владельцем; копия и локальная ветка убраны 03.11 |
+| 2026-11-03 | `fix/db-dates-race` (f377460) | #3 | зона A: миграция дат, копия базы, гонка заявок, изоляция тестов | принято, 56/0; ждёт merge |
 
 ## Зоны исполнителей
 
 | С | Исполнитель | Ветка | Файлы | Статус |
 | :--- | :--- | :--- | :--- | :--- |
 | 2026-11-03 | аудит (3 агента, только чтение) | — | весь код | готов, итог в `docs/AUDIT-2026-11-03.md` |
-| 2026-11-03 | исполнитель A | своя копия | `db.py`: миграции, `_connect`/пути, `decide_request`, `set_shift`; `shifts.py`; `tests/conftest.py`, `tests/test_shifts.py`, `tests/test_db.py` | в работе |
+| 2026-11-03 | исполнитель A | своя копия | `db.py`: миграции, `_connect`/пути, `decide_request`, `set_shift`; `shifts.py`; `tests/conftest.py`, `tests/test_shifts.py`, `tests/test_db.py` | сдано, PR #3 |
 | 2026-11-03 | исполнитель B | своя копия | `bot.py`; в `db.py` только `get_user_schedule`, `get_branch_schedule`, `get_request_recipients`; `tests/test_flows.py` и новые тесты; `README.md`, `.gitignore`, `.env.example` | в работе |
 
 Порядок приёмки: сначала A, затем B поверх A (B опирается на «`decide_request` → `None`, если заявка уже обработана»).
