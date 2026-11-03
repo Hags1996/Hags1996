@@ -34,6 +34,7 @@ import db
 import shifts
 from shifts import parse_date, parse_shift, format_date
 from db import ROLE_WORKER, ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN, MANAGEMENT_ROLES
+from db import USER_PENDING, USER_ACTIVE, USER_INACTIVE
 
 # =====================================================================
 # КОНФИГУРАЦИЯ БОТА
@@ -118,6 +119,12 @@ ROLE_NAMES = {
     ROLE_SUPERADMIN: "Администратор"
 }
 
+STATUS_NAMES = {
+    USER_PENDING: "⏳ Ждёт подтверждения",
+    USER_ACTIVE: "✅ Работает",
+    USER_INACTIVE: "🚫 Неактивен",
+}
+
 BRANCHES = ["Гагарина", "Абая"]
 
 SCHEDULE_DAYS = 14          # сколько дней расписания показывать
@@ -176,9 +183,9 @@ ALL_STATES = [
 # ПРОВЕРКА РОЛИ И ВВОДА
 # =====================================================================
 async def get_user_with_role(user_id: int, roles):
-    """Пользователь из БД, если у него одна из ролей roles, иначе None."""
+    """Активный пользователь из БД, если у него одна из ролей roles, иначе None."""
     user = await db.get_user(user_id)
-    if user and user['role'] in roles:
+    if user and user['role'] in roles and user['status'] == USER_ACTIVE:
         return user
     return None
 
@@ -330,6 +337,14 @@ def get_roles_keyboard(target_user_id: int) -> InlineKeyboardMarkup:
     markup.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_action"))
     return markup
 
+def get_registration_keyboard(target_user_id: int) -> InlineKeyboardMarkup:
+    markup = InlineKeyboardMarkup()
+    markup.add(
+        InlineKeyboardButton("✅ Подтвердить", callback_data=f"reg_ok:{target_user_id}"),
+        InlineKeyboardButton("❌ Отклонить", callback_data=f"reg_no:{target_user_id}")
+    )
+    return markup
+
 def get_request_keyboard(req_id: int) -> InlineKeyboardMarkup:
     markup = InlineKeyboardMarkup()
     markup.add(
@@ -339,38 +354,65 @@ def get_request_keyboard(req_id: int) -> InlineKeyboardMarkup:
     return markup
 
 # =====================================================================
-# МИДДЛВЕЙР ПРОВЕРКИ ПАУЗЫ БОТА
+# МИДДЛВЕЙР: СТАТУС ПОЛЬЗОВАТЕЛЯ И ПАУЗА БОТА
 # =====================================================================
 PAUSED_TEXT = "⛔️ Бот временно остановлен администратором."
+INACTIVE_TEXT = "🚫 Доступ закрыт, обратитесь к руководителю."
+PENDING_TEXT = "⏳ Ваша заявка ещё на рассмотрении."
+# Что доступно, пока заявка на доступ не подтверждена
+PENDING_ALLOWED_COMMANDS = {"/start", "/help", "/cancel"}
+CANCEL_TEXTS = {"❌ Отмена", "Отмена"}
 
 
-class PauseMiddleware(BaseMiddleware):
-    """Пауза проверяется здесь, до любых обработчиков — в том числе шагов FSM.
-    Администратор паузой не блокируется."""
+def _allowed_while_pending(update) -> bool:
+    if isinstance(update, telebot.types.CallbackQuery):
+        return update.data == "cancel_action"
+    text = (update.text or "").strip()
+    if text in CANCEL_TEXTS:
+        return True
+    command = text.split()[0].split("@")[0].lower() if text else ""
+    return command in PENDING_ALLOWED_COMMANDS
+
+
+class AccessMiddleware(BaseMiddleware):
+    """Общая проверка до любых обработчиков, в том числе шагов FSM:
+    неактивный — доступ закрыт; ждущий подтверждения — только /start, /help, /cancel;
+    пауза — для всех, кроме Администраторов."""
 
     def __init__(self):
         super().__init__()
         self.update_types = ['message', 'callback_query']
 
+    @staticmethod
+    async def _refuse(update, text):
+        if isinstance(update, telebot.types.CallbackQuery):
+            await bot.answer_callback_query(update.id, text, show_alert=True)
+        else:
+            await bot.send_message(update.chat.id, text)
+        return CancelUpdate()
+
     async def pre_process(self, update, data):
+        user = await db.get_user(update.from_user.id)
+        status = user['status'] if user else None
+        if status == USER_INACTIVE:
+            logger.debug("access: user=%s неактивен", uid_tag(update.from_user.id))
+            return await self._refuse(update, INACTIVE_TEXT)
+        if status == USER_PENDING and not _allowed_while_pending(update):
+            return await self._refuse(update, PENDING_TEXT)
+
         if not await db.is_bot_paused():
             return None
-        user = await db.get_user(update.from_user.id)
         role = user['role'] if user else None
         logger.debug("pause: user=%s, role=%s", uid_tag(update.from_user.id), role)
         if role == ROLE_SUPERADMIN:
             return None
-        if isinstance(update, telebot.types.CallbackQuery):
-            await bot.answer_callback_query(update.id, PAUSED_TEXT, show_alert=True)
-        else:
-            await bot.send_message(update.chat.id, PAUSED_TEXT)
-        return CancelUpdate()
+        return await self._refuse(update, PAUSED_TEXT)
 
     async def post_process(self, update, data, exception):
         pass
 
 
-bot.setup_middleware(PauseMiddleware())
+bot.setup_middleware(AccessMiddleware())
 
 # =====================================================================
 # СИСТЕМНЫЕ ХЭНДЛЕРЫ: ОТМЕНА, СПРАВКА, ПРОФИЛЬ
@@ -378,7 +420,7 @@ bot.setup_middleware(PauseMiddleware())
 # состоянии FSM, и без него (state="*" в telebot 4.37 не срабатывает без состояния).
 # =====================================================================
 @bot.message_handler(commands=['cancel'])
-@bot.message_handler(func=lambda m: m.text in ["❌ Отмена", "Отмена"])
+@bot.message_handler(func=lambda m: m.text in CANCEL_TEXTS)
 async def cmd_cancel(message: telebot.types.Message):
     """Сброс любого текущего состояния FSM и возврат в главное меню."""
     current_state = await bot.get_state(message.from_user.id, message.chat.id)
@@ -390,8 +432,12 @@ async def cmd_cancel(message: telebot.types.Message):
     else:
         text = "ℹ️ Нет активных действий для отмены."
 
-    if user:
+    if user and user['status'] == USER_ACTIVE:
         markup = get_main_keyboard(user['role'])
+    elif user:
+        # Заявка на доступ ещё не подтверждена — меню пока нет
+        markup = ReplyKeyboardRemove()
+        text += f"\n\n{PENDING_TEXT}"
     else:
         # Незарегистрированному не показываем меню работника — у него ещё ничего нет
         markup = ReplyKeyboardRemove()
@@ -432,6 +478,17 @@ async def reject_menu_in_state(message: telebot.types.Message):
 async def cmd_help(message: telebot.types.Message):
     """Справка по доступным возможностям бота с учетом роли пользователя."""
     user = await db.get_user(message.from_user.id)
+    if user and user['status'] == USER_PENDING:
+        await bot.send_message(
+            message.chat.id,
+            f"📖 <b>Справка по боту</b>\n\n{PENDING_TEXT}\n"
+            "Когда Администратор подтвердит доступ, бот пришлёт сообщение и покажет меню.\n\n"
+            "• /start — проверить статус заявки\n"
+            "• /help — эта справка\n"
+            "• /cancel — прервать текущее действие",
+            parse_mode="HTML"
+        )
+        return
     role = user['role'] if user else ROLE_WORKER
     role_title = ROLE_NAMES.get(role, "Пользователь")
 
@@ -492,7 +549,13 @@ async def cmd_profile(message: telebot.types.Message):
 @bot.message_handler(commands=['start'])
 async def cmd_start(message: telebot.types.Message):
     user = await db.get_user(message.from_user.id)
-    if user:
+    if user and user['status'] == USER_PENDING:
+        await bot.send_message(
+            message.chat.id,
+            f"{PENDING_TEXT}\nКогда Администратор подтвердит доступ, бот пришлёт сообщение.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+    elif user:
         logger.info("start: пользователь %s вернулся", uid_tag(message.from_user.id))
         await bot.send_message(
             message.chat.id,
@@ -576,34 +639,97 @@ async def process_position(message: telebot.types.Message):
         full_name = data['full_name']
         branch = data['branch']
 
-    # По умолчанию — Работник (если не первый суперадмин)
-    role = ROLE_SUPERADMIN if user_id == FIRST_SUPERADMIN_ID else ROLE_WORKER
-
-    await db.add_user(user_id, full_name, branch, position, role)
     await bot.delete_state(user_id, message.chat.id)
 
+    if user_id == FIRST_SUPERADMIN_ID:
+        # Первый Администратор подтверждения не ждёт
+        await db.add_user(user_id, full_name, branch, position, ROLE_SUPERADMIN, USER_ACTIVE)
+        await bot.send_message(
+            message.chat.id,
+            "🎉 Регистрация успешно завершена! Доступные функции отображены в меню ниже.",
+            reply_markup=get_main_keyboard(ROLE_SUPERADMIN)
+        )
+        return
+
+    # Остальные ждут подтверждения Администратора
+    await db.add_user(user_id, full_name, branch, position, ROLE_WORKER, USER_PENDING)
+    logger.info("Регистрация: заявка на доступ от %s", uid_tag(user_id))
     await bot.send_message(
         message.chat.id,
-        "🎉 Регистрация успешно завершена! Доступные функции отображены в меню ниже.",
-        reply_markup=get_main_keyboard(role)
+        "📨 Заявка на доступ отправлена, ждите подтверждения.\n"
+        "Когда Администратор её рассмотрит, бот пришлёт сообщение.",
+        reply_markup=ReplyKeyboardRemove()
     )
 
-    # Уведомление Суперадминам о новой регистрации
-    superadmins = await db.get_superadmins()
-    for admin in superadmins:
+    delivered = 0
+    for admin in await db.get_superadmins():
         try:
             await bot.send_message(
                 admin['telegram_id'],
-                f"🔔 <b>Новый пользователь зарегистрирован!</b>\n\n"
+                f"🔔 <b>Новая заявка на доступ</b>\n\n"
                 f"<b>ID:</b> <code>{user_id}</code>\n"
                 f"<b>ФИО:</b> {esc(full_name)}\n"
                 f"<b>Филиал:</b> {esc(branch)}\n"
-                f"<b>Должность:</b> {esc(position)}",
+                f"<b>Должность:</b> {esc(position)}\n\n"
+                "<i>После подтверждения можно назначить роль.</i>",
                 parse_mode="HTML",
-                reply_markup=get_roles_keyboard(user_id)
+                reply_markup=get_registration_keyboard(user_id)
             )
+            delivered += 1
         except Exception as e:
             logger.error("Не удалось уведомить админа %s о регистрации (%s)", uid_tag(admin['telegram_id']), type(e).__name__)
+    if not delivered:
+        logger.warning("Заявка на доступ от %s не доставлена ни одному Администратору", uid_tag(user_id))
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ Доставить заявку Администратору сейчас не удалось. Пожалуйста, сообщите руководителю лично."
+        )
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith(('reg_ok:', 'reg_no:')))
+async def process_registration_decision(call: telebot.types.CallbackQuery):
+    """Администратор подтверждает или отклоняет заявку на доступ."""
+    if not await get_user_with_role(call.from_user.id, (ROLE_SUPERADMIN,)):
+        await bot.answer_callback_query(call.id, NO_RIGHTS_TEXT, show_alert=True)
+        return
+    parsed = parse_callback(call.data, rf"(reg_ok|reg_no):({_ID_RE})")
+    if not parsed:
+        await bot.answer_callback_query(call.id, BAD_CALLBACK_TEXT)
+        return
+    approve, target_id = parsed[0] == "reg_ok", int(parsed[1])
+
+    target = await db.decide_registration(target_id, approve)
+    if not target:
+        await bot.answer_callback_query(call.id, "Заявка уже обработана", show_alert=True)
+        await _remove_buttons(call)
+        return
+
+    logger.info("Регистрация %s: %s", uid_tag(target_id), "подтверждена" if approve else "отклонена")
+    await bot.answer_callback_query(call.id, "Решение сохранено!")
+    await _remove_buttons(call)
+
+    if approve:
+        await bot.send_message(
+            call.message.chat.id,
+            f"✅ Доступ для <b>{esc(target['full_name'])}</b> подтверждён. "
+            f"Роль: <b>{ROLE_NAMES.get(target['role'], target['role'])}</b> — при необходимости выберите другую:",
+            parse_mode="HTML",
+            reply_markup=get_roles_keyboard(target_id)
+        )
+        user_text = "✅ Доступ подтверждён! Доступные функции отображены в меню ниже."
+        user_markup = get_main_keyboard(target['role'])
+    else:
+        await bot.send_message(
+            call.message.chat.id,
+            f"❌ Заявка на доступ <b>{esc(target['full_name'])}</b> отклонена.",
+            parse_mode="HTML"
+        )
+        user_text = "❌ В доступе отказано. Если это ошибка, обратитесь к руководителю."
+        user_markup = ReplyKeyboardRemove()
+    try:
+        await bot.send_message(target_id, user_text, reply_markup=user_markup)
+    except Exception as e:
+        logger.error("Не удалось сообщить решение по доступу пользователю %s (%s)", uid_tag(target_id), type(e).__name__)
 
 # =====================================================================
 # ХЭНДЛЕРЫ РАБОТНИКА
@@ -1082,7 +1208,7 @@ async def process_broadcast_send(call: telebot.types.CallbackQuery):
     await bot.answer_callback_query(call.id, "Рассылка началась…")
     await _remove_buttons(call)
 
-    users = await db.get_all_users()
+    users = await db.get_active_users()
     sent, failed = await mass_send(users, broadcast_text(text), "Рассылка")
     logger.info("Рассылка: отправлено %s, не доставлено %s", sent, failed)
     await bot.send_message(
@@ -1103,7 +1229,7 @@ async def toggle_bot_pause(message: telebot.types.Message):
     else:
         status_msg = "✅ <b>Работа бота возобновлена!</b>"
 
-    users = await db.get_all_users()
+    users = await db.get_active_users()
     sent, failed = await mass_send(users, status_msg, "Оповещение о паузе")
     logger.info("Пауза бота: %s; оповещено %s, не доставлено %s", new_state, sent, failed)
 

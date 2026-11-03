@@ -215,13 +215,84 @@ async def get_user(telegram_id: int):
             return await cursor.fetchone()
 
 
-async def add_user(telegram_id: int, full_name: str, branch: str, position: str, role: str = ROLE_WORKER):
+async def add_user(telegram_id: int, full_name: str, branch: str, position: str,
+                   role: str = ROLE_WORKER, status: str = USER_ACTIVE):
     async with _connect() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO users (telegram_id, full_name, branch, position, role) VALUES (?, ?, ?, ?, ?)",
-            (telegram_id, full_name, branch, position, role)
+            "INSERT OR REPLACE INTO users (telegram_id, full_name, branch, position, role, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (telegram_id, full_name, branch, position, role, status)
         )
         await db.commit()
+
+
+async def decide_registration(telegram_id: int, approve: bool):
+    """Подтвердить (active) или отклонить (inactive) заявку на доступ.
+
+    Условный UPDATE ... AND status = 'pending': из двух одновременных нажатий
+    срабатывает одно. Возвращает пользователя (Row) или None, если заявка
+    уже обработана или такого пользователя нет."""
+    new_status = USER_ACTIVE if approve else USER_INACTIVE
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "UPDATE users SET status = ? WHERE telegram_id = ? AND status = ?",
+            (new_status, telegram_id, USER_PENDING)
+        )
+        await db.commit()
+        if cursor.rowcount != 1:
+            return None
+        async with db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
+            return await cursor.fetchone()
+
+
+async def deactivate_user(telegram_id: int) -> int | None:
+    """Сделать сотрудника неактивным и закрыть (REJECTED) его ожидающие заявки.
+    Смены и история остаются.
+
+    Последнего активного Администратора деактивировать нельзя — проверка в том же
+    условном UPDATE, поэтому два Администратора не выключат друг друга одновременно.
+    Возвращает число закрытых заявок или None, если статус не изменён
+    (уже неактивен, ждёт подтверждения, последний Администратор, нет такого)."""
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "UPDATE users SET status = ? WHERE telegram_id = ? AND status = ? "
+                "AND (role != ? OR (SELECT COUNT(*) FROM users WHERE role = ? AND status = ?) > 1)",
+                (USER_INACTIVE, telegram_id, USER_ACTIVE, ROLE_SUPERADMIN, ROLE_SUPERADMIN, USER_ACTIVE)
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return None
+            cursor = await db.execute(
+                "UPDATE schedule_requests SET status = ? WHERE user_id = ? AND status = ?",
+                (REQUEST_REJECTED, telegram_id, REQUEST_PENDING)
+            )
+            closed = cursor.rowcount
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return closed
+
+
+async def activate_user(telegram_id: int) -> bool:
+    """Вернуть неактивного сотрудника в работу. False — он не был неактивным."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "UPDATE users SET status = ? WHERE telegram_id = ? AND status = ?",
+            (USER_ACTIVE, telegram_id, USER_INACTIVE)
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def set_user_branch(telegram_id: int, branch: str) -> bool:
+    async with _connect() as db:
+        cursor = await db.execute("UPDATE users SET branch = ? WHERE telegram_id = ?", (branch, telegram_id))
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 async def update_user_role(telegram_id: int, role: str):
@@ -230,24 +301,41 @@ async def update_user_role(telegram_id: int, role: str):
         await db.commit()
 
 
-async def count_superadmins() -> int:
+async def count_superadmins(active_only: bool = False) -> int:
+    """Число Администраторов; active_only — только активных."""
     async with _connect() as db:
-        async with db.execute("SELECT COUNT(*) FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE role = ? AND (? = 0 OR status = ?)",
+            (ROLE_SUPERADMIN, int(active_only), USER_ACTIVE)
+        ) as cursor:
             res = await cursor.fetchone()
             return res[0] if res else 0
 
 
 async def get_all_users():
+    """Все пользователи, с любым статусом."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users") as cursor:
             return await cursor.fetchall()
 
 
-async def get_branch_users(branch: str):
+async def get_active_users():
+    """Активные пользователи — для рассылки и оповещения о паузе."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE branch = ?", (branch,)) as cursor:
+        async with db.execute("SELECT * FROM users WHERE status = ?", (USER_ACTIVE,)) as cursor:
+            return await cursor.fetchall()
+
+
+async def get_branch_users(branch: str, status: str = USER_ACTIVE):
+    """Сотрудники филиала с данным статусом (по умолчанию — активные), по ФИО."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE branch = ? AND status = ? ORDER BY full_name",
+            (branch, status)
+        ) as cursor:
             return await cursor.fetchall()
 
 
@@ -255,16 +343,19 @@ async def get_managers_and_admins(branch: str):
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?)",
-            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN)
+            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?) AND status = ?",
+            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN, USER_ACTIVE)
         ) as cursor:
             return await cursor.fetchall()
 
 
 async def get_superadmins():
+    """Активные Администраторы."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
+        async with db.execute(
+            "SELECT * FROM users WHERE role = ? AND status = ?", (ROLE_SUPERADMIN, USER_ACTIVE)
+        ) as cursor:
             return await cursor.fetchall()
 
 
@@ -321,9 +412,9 @@ async def get_branch_schedule(branch: str, date_from: str | None = None, date_to
             LEFT JOIN schedules s ON s.user_id = u.telegram_id
                 AND (? IS NULL OR s.date_str >= ?)
                 AND (? IS NULL OR s.date_str <= ?)
-            WHERE u.branch = ?
+            WHERE u.branch = ? AND u.status = ?
             ORDER BY u.telegram_id, s.date_str
-        """, (date_from, date_from, date_to, date_to, branch)) as cursor:
+        """, (date_from, date_from, date_to, date_to, branch, USER_ACTIVE)) as cursor:
             rows = await cursor.fetchall()
 
     employees = {}
@@ -368,8 +459,8 @@ async def get_pending_requests(branch: str):
             SELECT sr.id, sr.user_id, sr.date_str, sr.desired_time, u.full_name, u.position
             FROM schedule_requests sr
             JOIN users u ON sr.user_id = u.telegram_id
-            WHERE u.branch = ? AND sr.status = 'PENDING'
-        """, (branch,)) as cursor:
+            WHERE u.branch = ? AND sr.status = ? AND u.status = ?
+        """, (branch, REQUEST_PENDING, USER_ACTIVE)) as cursor:
             return await cursor.fetchall()
 
 

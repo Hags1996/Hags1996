@@ -20,12 +20,16 @@ def test_new_user_full_registration(tg):
     assert any("Введите вашу должность" in t for t in tg.texts_to(replies, 222))
 
     replies = tg.send(222, "Бариста")
-    assert any("Регистрация успешно завершена" in t for t in tg.texts_to(replies, 222))
-    assert any("Новый пользователь" in t for t in tg.texts_to(replies, ADMIN_ID))
+    assert any("Заявка на доступ отправлена, ждите подтверждения" in t for t in tg.texts_to(replies, 222))
+    assert any("Новая заявка на доступ" in t for t in tg.texts_to(replies, ADMIN_ID))
 
     user = run(db.get_user(222))
-    assert (user["full_name"], user["branch"], user["position"], user["role"]) == \
-        ("Иванов Иван", "Абая", "Бариста", db.ROLE_WORKER)
+    assert (user["full_name"], user["branch"], user["position"], user["role"], user["status"]) == \
+        ("Иванов Иван", "Абая", "Бариста", db.ROLE_WORKER, db.USER_PENDING)
+
+    replies = tg.press(ADMIN_ID, "reg_ok:222")
+    assert any("Доступ подтверждён" in t for t in tg.texts_to(replies, 222))
+    assert run(db.get_user(222))["status"] == db.USER_ACTIVE
 
 
 def test_cancel_during_registration(tg):
