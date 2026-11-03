@@ -37,3 +37,7 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+
+# FSM states (bot.py, StatePickleStorage)
+bot_states.pkl
+bot_states.pkl.tmp
