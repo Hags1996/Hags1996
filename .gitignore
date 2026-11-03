@@ -13,6 +13,7 @@ ENV/
 *.db
 *.sqlite3
 bot_data.db
+*.db.bak-*
 
 # Sensitive environment variables
 .env
@@ -37,3 +38,7 @@ Thumbs.db
 
 # Pytest
 .pytest_cache/
+
+# FSM states (bot.py, StatePickleStorage)
+bot_states.pkl
+bot_states.pkl.tmp
