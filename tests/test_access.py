@@ -194,3 +194,182 @@ def test_registration_not_delivered_is_reported(tg, monkeypatch):
     fail_requests(tg, monkeypatch, "sendMessage", chat_id=ADMIN_ID)
     replies = tg.send(NEWBIE, "Бариста")
     assert any("сообщите руководителю лично" in t for t in tg.texts_to(replies, NEWBIE))
+
+
+# ---------------------------------------------------------------------
+# 3. Карточка сотрудника: неактивный, возврат в работу, перевод
+# ---------------------------------------------------------------------
+def request_status(req_id):
+    import sqlite3
+    con = sqlite3.connect(db.DB_FILE)
+    try:
+        return con.execute("SELECT status FROM schedule_requests WHERE id = ?", (req_id,)).fetchone()[0]
+    finally:
+        con.close()
+
+
+def test_staff_list_and_card_for_manager(branch):
+    replies = branch.send(MANAGER, B.BTN_STAFF)
+    data = callbacks(replies)
+    assert f"emp:{WORKER}" in data and f"emp:{MANAGER2}" in data and "staff_inactive:Абая" in data
+    assert f"emp:{FOREIGN_WORKER}" not in data
+
+    replies = branch.press(MANAGER, f"emp:{WORKER}")
+    card = branch.texts_to(replies, MANAGER)[-1]
+    for part in ("Иванов Иван", "Бариста", "Абая", "Работник", "Работает"):
+        assert part in card
+    data = callbacks(replies)
+    assert f"edit_emp:{WORKER}" in data and f"emp_off:{WORKER}" in data
+    assert f"emp_move:{WORKER}" not in data  # перевод — только Администратор
+
+    own = callbacks(branch.press(MANAGER, f"emp:{MANAGER}"))
+    assert f"emp_off:{MANAGER}" not in own
+
+
+def test_change_shift_from_card(branch):
+    branch.press(MANAGER, f"emp:{WORKER}")
+    branch.press(MANAGER, f"edit_emp:{WORKER}")
+    branch.send(MANAGER, "25.10")
+    replies = branch.send(MANAGER, "08:00 - 20:00")
+    assert any("успешно обновлено" in t for t in branch.texts_to(replies, MANAGER))
+
+
+def test_deactivate_employee(branch, monkeypatch):
+    monkeypatch.setattr(B, "BROADCAST_DELAY", 0)
+    run(db.set_shift(WORKER, "2026-10-05", "08:00 - 20:00"))
+    request_change(branch, WORKER)
+    req_id = pending_ids("Абая")[0]
+
+    replies = branch.press(MANAGER, f"emp_off:{WORKER}")
+    assert answers(replies) == ["Сотрудник отключён"]
+    assert B.INACTIVE_TEXT in branch.texts_to(replies, WORKER)
+    assert run(db.get_user(WORKER))["status"] == db.USER_INACTIVE
+    assert request_status(req_id) == db.REQUEST_REJECTED           # ожидающие заявки закрыты
+    assert run(db.get_user_schedule(WORKER)) != []                  # смены остались
+
+    # любое действие — «Доступ закрыт»
+    for text in ("/start", B.BTN_MY_SCHEDULE, "/help"):
+        assert branch.texts_to(branch.send(WORKER, text), WORKER) == [B.INACTIVE_TEXT]
+    assert answers(branch.press(WORKER, "cancel_action")) == [B.INACTIVE_TEXT]
+
+    # не виден в расписании и списках, не получает рассылку и оповещение о паузе
+    text = "\n".join(branch.texts_to(branch.send(MANAGER, B.BTN_BRANCH_SCHEDULE), MANAGER))
+    assert "Иванов Иван" not in text
+    assert f"edit_emp:{WORKER}" not in callbacks(branch.send(MANAGER, B.BTN_EDIT_SCHEDULE))
+    assert f"emp:{WORKER}" not in callbacks(branch.send(MANAGER, B.BTN_STAFF))
+    assert branch.texts_to(branch.send(ADMIN_ID, B.BTN_PAUSE), WORKER) == []
+    branch.send(ADMIN_ID, B.BTN_PAUSE)
+    branch.send(ADMIN_ID, B.BTN_BROADCAST)
+    branch.send(ADMIN_ID, "Объявление")
+    assert branch.texts_to(branch.press(ADMIN_ID, "broadcast_send"), WORKER) == []
+
+
+def test_inactive_manager_gets_no_requests(branch):
+    branch.press(MANAGER, f"emp_off:{MANAGER2}")
+    replies = request_change(branch, WORKER)
+    assert branch.texts_to(replies, MANAGER2) == []
+    assert any("Новый запрос" in t for t in branch.texts_to(replies, MANAGER))
+    assert [u["telegram_id"] for u in run(db.get_request_recipients("Абая"))] == [MANAGER]
+
+
+def test_deactivated_during_input_cannot_finish(branch):
+    branch.send(WORKER, B.BTN_REQUEST)
+    branch.press(MANAGER, f"emp_off:{WORKER}")
+    assert branch.texts_to(branch.send(WORKER, "25.10"), WORKER) == [B.INACTIVE_TEXT]
+    run(db.activate_user(WORKER))
+    branch.send(WORKER, "08:00 - 20:00")  # состояние ввода сброшено при отключении
+    assert pending_ids("Абая") == []
+
+
+def test_reactivate_employee(branch):
+    branch.press(MANAGER, f"emp_off:{WORKER}")
+    replies = branch.press(MANAGER, "staff_inactive:Абая")
+    assert f"emp:{WORKER}" in callbacks(replies)
+    card = callbacks(branch.press(MANAGER, f"emp:{WORKER}"))
+    assert f"emp_on:{WORKER}" in card and f"edit_emp:{WORKER}" not in card
+
+    replies = branch.press(MANAGER, f"emp_on:{WORKER}")
+    assert answers(replies) == ["Сотрудник снова в работе"]
+    assert any("снова открыт" in t for t in branch.texts_to(replies, WORKER))
+    assert run(db.get_user(WORKER))["status"] == db.USER_ACTIVE
+    assert answers(branch.press(MANAGER, f"emp_on:{WORKER}")) == ["Статус уже изменён"]
+
+
+def test_edit_shift_of_inactive_is_refused(branch):
+    branch.press(MANAGER, f"emp_off:{WORKER}")
+    assert answers(branch.press(MANAGER, f"edit_emp:{WORKER}")) == [B.NOT_ACTIVE_TARGET_TEXT]
+    assert run(db.get_user_schedule(WORKER)) == []
+
+
+def test_cannot_deactivate_self(branch):
+    assert answers(branch.press(MANAGER, f"emp_off:{MANAGER}")) == ["❌ Нельзя сделать неактивным себя."]
+    assert answers(branch.press(ADMIN_ID, f"emp_off:{ADMIN_ID}")) == ["❌ Нельзя сделать неактивным себя."]
+    assert run(db.get_user(MANAGER))["status"] == db.USER_ACTIVE
+
+
+def test_rights_for_card_actions(branch):
+    for uid, data in ((WORKER, f"emp_off:{MANAGER}"), (WORKER, f"emp:{MANAGER}"),
+                      (MANAGER, f"emp_off:{FOREIGN_WORKER}"), (MANAGER, f"emp:{FOREIGN_WORKER}"),
+                      (MANAGER, f"emp_move:{WORKER}"), (MANAGER, f"emp_to:{WORKER}:Гагарина")):
+        assert answers(branch.press(uid, data)) == [B.NO_RIGHTS_TEXT], (uid, data)
+    assert run(db.get_user(MANAGER))["status"] == db.USER_ACTIVE
+    assert run(db.get_user(FOREIGN_WORKER))["status"] == db.USER_ACTIVE
+    assert run(db.get_user(WORKER))["branch"] == "Абая"
+
+
+def test_manager_cannot_deactivate_superadmin(branch):
+    run(db.update_user_role(MANAGER2, db.ROLE_SUPERADMIN))  # Администратор, приписанный к «Абая»
+    assert answers(branch.press(MANAGER, f"emp_off:{MANAGER2}")) == [B.NO_RIGHTS_TEXT]
+    assert run(db.get_user(MANAGER2))["status"] == db.USER_ACTIVE
+
+
+def test_last_superadmin_cannot_be_deactivated(branch):
+    run(db.update_user_role(MANAGER2, db.ROLE_SUPERADMIN))
+    assert answers(branch.press(MANAGER2, f"emp_off:{ADMIN_ID}")) == ["Сотрудник отключён"]
+    assert run(db.deactivate_user(MANAGER2)) is None  # остался один активный Администратор
+    assert run(db.get_user(MANAGER2))["status"] == db.USER_ACTIVE
+    # и роль последнего активного Администратора снять нельзя
+    branch.press(MANAGER2, f"set_role:{MANAGER2}:{db.ROLE_WORKER}")
+    assert run(db.get_user(MANAGER2))["role"] == db.ROLE_SUPERADMIN
+
+
+def test_two_superadmins_cannot_deactivate_each_other_at_once(branch):
+    import asyncio
+    run(db.update_user_role(MANAGER2, db.ROLE_SUPERADMIN))
+
+    async def both():
+        return await asyncio.gather(db.deactivate_user(ADMIN_ID), db.deactivate_user(MANAGER2))
+
+    assert sum(r is not None for r in run(both())) == 1
+    assert run(db.count_superadmins(active_only=True)) == 1
+
+
+def test_superadmin_moves_employee_to_branch(branch):
+    replies = branch.send(ADMIN_ID, B.BTN_STAFF)
+    assert "pick_branch:staff:Абая" in callbacks(replies) and "staff_other" in callbacks(replies)
+    assert f"emp:{WORKER}" in callbacks(branch.press(ADMIN_ID, "pick_branch:staff:Абая"))
+    assert f"emp_move:{WORKER}" in callbacks(branch.press(ADMIN_ID, f"emp:{WORKER}"))
+
+    replies = branch.press(ADMIN_ID, f"emp_move:{WORKER}")
+    assert callbacks(replies)[:1] == [f"emp_to:{WORKER}:Гагарина"]
+    replies = branch.press(ADMIN_ID, f"emp_to:{WORKER}:Гагарина")
+    assert answers(replies) == ["Сотрудник переведён"]
+    assert any("Гагарина" in t for t in branch.texts_to(replies, WORKER))
+    assert run(db.get_user(WORKER))["branch"] == "Гагарина"
+    assert answers(branch.press(ADMIN_ID, f"emp_to:{WORKER}:Гугл")) == ["Такого филиала нет."]
+
+
+def test_superadmin_moves_test_branch_record(branch):
+    run(db.add_user(9001, "Старый Тестов", "Гугл", "Бариста"))
+    replies = branch.press(ADMIN_ID, "staff_other")
+    data = callbacks(replies)
+    assert "emp:9001" in data and f"emp:{ADMIN_ID}" in data and f"emp:{WORKER}" not in data
+    assert answers(branch.press(MANAGER, "staff_other")) == [B.NO_RIGHTS_TEXT]
+    branch.press(ADMIN_ID, "emp_to:9001:Абая")
+    assert run(db.get_user(9001))["branch"] == "Абая"
+
+
+@pytest.mark.parametrize("data", ["emp:abc", "emp_off:²", "emp_on:", "emp_move:1:2", "emp_to:1",
+                                  "staff_inactive:Гугл"])
+def test_forged_card_callbacks(branch, data):
+    assert answers(branch.press(ADMIN_ID, data)) == [B.BAD_CALLBACK_TEXT]
