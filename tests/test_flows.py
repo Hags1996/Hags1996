@@ -1,4 +1,6 @@
 """Основные сценарии бота: регистрация, заявки, расписание филиала."""
+from datetime import date
+
 import db
 from conftest import ADMIN_ID, register, run
 
@@ -54,7 +56,7 @@ def test_branch_schedule_lists_everyone(tg):
     register(tg, 222, name="Иванов Иван", branch="Абая")
     register(tg, 333, name="Петров Пётр", branch="Абая")
     run(db.update_user_role(333, db.ROLE_MANAGER))
-    run(db.set_shift(222, "25.10", "08:00 - 20:00"))
+    run(db.set_shift(222, date.today().isoformat(), "08:00 - 20:00"))
 
     text = tg.texts_to(tg.send(333, "🏢 Расписание филиала"), 333)[0]
     assert "Иванов Иван" in text and "08:00 - 20:00" in text
