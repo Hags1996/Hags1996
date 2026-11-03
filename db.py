@@ -41,6 +41,16 @@ REQUEST_APPROVED = "APPROVED"
 REQUEST_REJECTED = "REJECTED"
 REQUEST_SUPERSEDED = "SUPERSEDED"  # менеджер сам назначил смену на эту дату
 
+# Значения users.status
+USER_PENDING = "pending"    # зарегистрировался, ждёт подтверждения Администратора
+USER_ACTIVE = "active"      # работает
+USER_INACTIVE = "inactive"  # уволен / отклонён: доступ закрыт, история остаётся
+
+# Филиал первого Администратора: ему филиал не важен, он выбирает его кнопками
+NO_BRANCH = "—"
+
+SCHEMA_VERSION = 2
+
 _UPSERT_SHIFT_SQL = (
     "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
     "ON CONFLICT(user_id, date_str) DO UPDATE SET shift_time = excluded.shift_time"
@@ -65,7 +75,8 @@ async def init_db(first_superadmin_id: int, today: date | None = None):
                 full_name TEXT NOT NULL,
                 branch TEXT NOT NULL,
                 position TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'worker'
+                role TEXT NOT NULL DEFAULT 'worker',
+                status TEXT NOT NULL DEFAULT 'active'
             )
         """)
         await db.execute("""
@@ -102,11 +113,14 @@ async def init_db(first_superadmin_id: int, today: date | None = None):
             async with db.execute("SELECT role FROM users WHERE telegram_id = ?", (first_superadmin_id,)) as cursor:
                 user = await cursor.fetchone()
             if user:
-                await db.execute("UPDATE users SET role = ? WHERE telegram_id = ?", (ROLE_SUPERADMIN, first_superadmin_id))
+                await db.execute(
+                    "UPDATE users SET role = ?, status = ? WHERE telegram_id = ?",
+                    (ROLE_SUPERADMIN, USER_ACTIVE, first_superadmin_id)
+                )
             else:
                 await db.execute(
-                    "INSERT INTO users (telegram_id, full_name, branch, position, role) VALUES (?, ?, ?, ?, ?)",
-                    (first_superadmin_id, "Главный Администратор", "Гугл", "Суперадмин", ROLE_SUPERADMIN)
+                    "INSERT INTO users (telegram_id, full_name, branch, position, role, status) VALUES (?, ?, ?, ?, ?, ?)",
+                    (first_superadmin_id, "Главный Администратор", NO_BRANCH, "Суперадмин", ROLE_SUPERADMIN, USER_ACTIVE)
                 )
         await db.commit()
 
@@ -135,7 +149,7 @@ def _sqlite_backup(src: str, dst: str):
 
 
 async def _backup_before_migration(today: date) -> Path | None:
-    """Если база старая (user_version < 1 и в ней есть таблицы) — копия до миграции."""
+    """Если база старая (user_version < SCHEMA_VERSION и в ней есть таблицы) — копия до миграции."""
     if not Path(DB_FILE).exists():
         return None
     async with _connect() as db:
@@ -143,7 +157,7 @@ async def _backup_before_migration(today: date) -> Path | None:
             version = (await cursor.fetchone())[0]
         async with db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1") as cursor:
             has_tables = await cursor.fetchone() is not None
-    if version >= 1 or not has_tables:
+    if version >= SCHEMA_VERSION or not has_tables:
         return None
     target = _backup_path(today)
     await asyncio.to_thread(_sqlite_backup, DB_FILE, str(target))
@@ -179,6 +193,16 @@ async def _migrate(db, today: date):
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_schedules_user_date ON schedules(user_id, date_str)"
         )
         await db.execute("PRAGMA user_version = 1")
+
+    if version < 2:
+        # Статус пользователя. Все, кто уже есть в базе, — работают (active).
+        async with db.execute("PRAGMA table_info(users)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        if "status" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        await db.execute("UPDATE users SET status = ?", (USER_ACTIVE,))
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_users_branch_status ON users(branch, status)")
+        await db.execute("PRAGMA user_version = 2")
 
 
 # ---------------------------------------------------------------------

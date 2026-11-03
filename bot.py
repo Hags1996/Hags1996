@@ -118,7 +118,7 @@ ROLE_NAMES = {
     ROLE_SUPERADMIN: "Администратор"
 }
 
-BRANCHES = ["Гагарина", "Абая", "Гугл"]
+BRANCHES = ["Гагарина", "Абая"]
 
 SCHEDULE_DAYS = 14          # сколько дней расписания показывать
 MAX_MESSAGE_LEN = 4096      # лимит Telegram на длину сообщения
