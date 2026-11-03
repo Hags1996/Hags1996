@@ -283,6 +283,7 @@ BAD_SHIFT_TEXT = (
 NOT_REGISTERED_TEXT = "⚠️ Вы еще не зарегистрированы в системе. Нажмите /start для регистрации."
 BAD_CALLBACK_TEXT = "Некорректные данные"
 NO_RIGHTS_TEXT = "⛔️ Недостаточно прав."
+OWN_REQUEST_TEXT = "⛔️ Нельзя решать собственную заявку."
 
 # =====================================================================
 # КЛАВИАТУРЫ И ИНТЕРФЕЙС
@@ -673,7 +674,7 @@ async def process_req_time(message: telebot.types.Message):
     req_id = await db.create_request(user_id, date_str, desired_time)
 
     # Руководство филиала, а если его нет — Администраторы
-    recipients = await db.get_request_recipients(user['branch'])
+    recipients = await db.get_request_recipients(user['branch'], exclude_id=user_id)
     delivered = 0
     for mgr in recipients:
         try:
@@ -735,14 +736,18 @@ async def show_pending_requests(chat_id, branch: str):
         return
 
     for r in requests:
-        await bot.send_message(
-            chat_id,
+        own = r['user_id'] == chat_id  # личный чат: chat_id — это ID руководителя
+        text = (
             f"📋 <b>Запрос №{r['id']}</b>\n"
             f"<b>Сотрудник:</b> {esc(r['full_name'])} ({esc(r['position'])})\n"
             f"<b>Дата:</b> {esc(format_date(r['date_str']))}\n"
-            f"<b>Желаемое время:</b> {esc(r['desired_time'])}",
-            parse_mode="HTML",
-            reply_markup=get_request_keyboard(r['id'])
+            f"<b>Желаемое время:</b> {esc(r['desired_time'])}"
+        )
+        if own:
+            text += "\n\n<i>Это ваша заявка — её решает другой руководитель.</i>"
+        await bot.send_message(
+            chat_id, text, parse_mode="HTML",
+            reply_markup=None if own else get_request_keyboard(r['id'])
         )
 
 
@@ -819,9 +824,12 @@ async def process_request_decision(call: telebot.types.CallbackQuery):
     action, req_id = parsed[0], int(parsed[1])
 
     manager = await get_user_with_role(call.from_user.id, MANAGEMENT_ROLES)
-    req_branch = await db.get_request_branch(req_id)
-    if not manager or req_branch is None or not can_manage_branch(manager, req_branch):
+    info = await db.get_request_info(req_id)
+    if not manager or info is None or not can_manage_branch(manager, info['branch']):
         await bot.answer_callback_query(call.id, NO_RIGHTS_TEXT, show_alert=True)
+        return
+    if info['user_id'] == manager['telegram_id']:
+        await bot.answer_callback_query(call.id, OWN_REQUEST_TEXT, show_alert=True)
         return
 
     approve = action == 'app_req'

@@ -268,19 +268,26 @@ async def get_superadmins():
             return await cursor.fetchall()
 
 
-async def get_request_recipients(branch: str):
-    """Кому доставить заявку сотрудника: Менеджеры и Управляющие филиала,
-    а если их в филиале нет — Администраторы (чтобы заявка не терялась)."""
+async def get_request_recipients(branch: str, exclude_id: int | None = None):
+    """Кому доставить заявку сотрудника: активные Менеджеры и Управляющие филиала,
+    а если их в филиале нет — активные Администраторы (чтобы заявка не терялась).
+
+    exclude_id — автор заявки: свою заявку руководитель не получает и решать не может.
+    """
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?)",
-            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN)
+            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?) AND status = ? "
+            "AND (? IS NULL OR telegram_id != ?)",
+            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN, USER_ACTIVE, exclude_id, exclude_id)
         ) as cursor:
             rows = await cursor.fetchall()
         if rows:
             return rows
-        async with db.execute("SELECT * FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
+        async with db.execute(
+            "SELECT * FROM users WHERE role = ? AND status = ? AND (? IS NULL OR telegram_id != ?)",
+            (ROLE_SUPERADMIN, USER_ACTIVE, exclude_id, exclude_id)
+        ) as cursor:
             return await cursor.fetchall()
 
 
@@ -376,6 +383,18 @@ async def get_request_branch(req_id: int):
         """, (req_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else None
+
+
+async def get_request_info(req_id: int):
+    """Автор заявки и его филиал: Row(user_id, branch) или None, если заявки нет."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT sr.user_id, u.branch FROM schedule_requests sr
+            JOIN users u ON sr.user_id = u.telegram_id
+            WHERE sr.id = ?
+        """, (req_id,)) as cursor:
+            return await cursor.fetchone()
 
 
 async def decide_request(req_id: int, approve: bool):
