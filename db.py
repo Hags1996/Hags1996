@@ -168,29 +168,55 @@ async def get_superadmins():
             return await cursor.fetchall()
 
 
-# ---------------------------------------------------------------------
-# Расписание
-# ---------------------------------------------------------------------
-async def get_user_schedule(user_id: int):
+async def get_request_recipients(branch: str):
+    """Кому доставить заявку сотрудника: Менеджеры и Управляющие филиала,
+    а если их в филиале нет — Администраторы (чтобы заявка не терялась)."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT date_str, shift_time FROM schedules WHERE user_id = ? ORDER BY date_str", (user_id,)
+            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?)",
+            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN)
+        ) as cursor:
+            rows = await cursor.fetchall()
+        if rows:
+            return rows
+        async with db.execute("SELECT * FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
+            return await cursor.fetchall()
+
+
+# ---------------------------------------------------------------------
+# Расписание
+# ---------------------------------------------------------------------
+async def get_user_schedule(user_id: int, date_from: str | None = None, date_to: str | None = None):
+    """Смены сотрудника по дате. date_from/date_to — «ГГГГ-ММ-ДД» включительно, None — без границы."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT date_str, shift_time FROM schedules WHERE user_id = ? "
+            "AND (? IS NULL OR date_str >= ?) AND (? IS NULL OR date_str <= ?) "
+            "ORDER BY date_str",
+            (user_id, date_from, date_from, date_to, date_to)
         ) as cursor:
             return await cursor.fetchall()
 
 
-async def get_branch_schedule(branch: str):
-    """Сотрудники филиала и их смены одним запросом: {user_row: [schedule_rows]}."""
+async def get_branch_schedule(branch: str, date_from: str | None = None, date_to: str | None = None):
+    """Сотрудники филиала и их смены одним запросом: [{full_name, position, shifts}].
+
+    Фильтр по датам стоит в условии JOIN, поэтому сотрудник без смен
+    в этом периоде всё равно попадает в список (с пустым shifts).
+    """
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("""
             SELECT u.telegram_id, u.full_name, u.position, s.date_str, s.shift_time
             FROM users u
             LEFT JOIN schedules s ON s.user_id = u.telegram_id
+                AND (? IS NULL OR s.date_str >= ?)
+                AND (? IS NULL OR s.date_str <= ?)
             WHERE u.branch = ?
             ORDER BY u.telegram_id, s.date_str
-        """, (branch,)) as cursor:
+        """, (date_from, date_from, date_to, date_to, branch)) as cursor:
             rows = await cursor.fetchall()
 
     employees = {}
