@@ -160,3 +160,77 @@ def test_manager_shift_supersedes_pending_request(fresh_db):
     # старая кнопка «Принять» больше не перетирает смену, назначенную менеджером
     assert run(db.decide_request(same_day, True)) is None
     assert schedule(WORKER) == [("2026-10-25", "Выходной")]
+
+
+# ---------------------------------------------------------------------
+# Миграция 2: статус пользователя; тестовый филиал «Гугл» убран
+# ---------------------------------------------------------------------
+def make_v1_db(path):
+    """База версии 1 (даты уже ГГГГ-ММ-ДД, колонки status нет), с записью в «Гугл»."""
+    con = sqlite3.connect(path)
+    con.executescript("""
+        CREATE TABLE users (telegram_id INTEGER PRIMARY KEY, full_name TEXT NOT NULL, branch TEXT NOT NULL,
+                            position TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'worker');
+        CREATE TABLE schedules (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                                date_str TEXT NOT NULL, shift_time TEXT NOT NULL);
+        CREATE UNIQUE INDEX idx_schedules_user_date ON schedules(user_id, date_str);
+        CREATE TABLE schedule_requests (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+                                        date_str TEXT NOT NULL, desired_time TEXT NOT NULL,
+                                        status TEXT NOT NULL DEFAULT 'PENDING');
+        INSERT INTO users VALUES (5, 'Старый Работник', 'Абая', 'Бариста', 'worker');
+        INSERT INTO users VALUES (111, 'Главный Администратор', 'Гугл', 'Суперадмин', 'superadmin');
+        INSERT INTO schedules (user_id, date_str, shift_time) VALUES (5, '2026-10-01', '08:00 - 20:00');
+        PRAGMA user_version = 1;
+    """)
+    con.commit()
+    con.close()
+
+
+def test_migration_2_adds_status_with_backup(tmp_path, monkeypatch):
+    path = tmp_path / "v1.db"
+    make_v1_db(path)
+    monkeypatch.setattr(db, "DB_FILE", str(path))
+
+    run(db.init_db(ADMIN_ID, today=MIGRATION_DAY))
+
+    backup = tmp_path / "v1.db.bak-20261103"
+    assert backup.exists()
+    con = sqlite3.connect(backup)
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+    con.close()
+
+    con = sqlite3.connect(path)
+    assert con.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert con.execute("SELECT telegram_id, branch, status FROM users ORDER BY telegram_id").fetchall() == \
+        [(5, "Абая", "active"), (111, "Гугл", "active")]  # «Гугл» в базе не трогаем
+    assert con.execute("SELECT date_str FROM schedules").fetchall() == [("2026-10-01",)]
+    indexes = {r[1] for r in con.execute("PRAGMA index_list(users)").fetchall()}
+    assert "idx_users_branch_status" in indexes
+    con.execute("UPDATE users SET status = 'inactive' WHERE telegram_id = 5")
+    con.commit()
+    con.close()
+
+    run(db.init_db(ADMIN_ID, today=date(2026, 11, 4)))  # повторный запуск: без копии и без сброса статусов
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["v1.db", "v1.db.bak-20261103"]
+    assert run(db.get_user(5))["status"] == db.USER_INACTIVE
+
+
+def test_migration_2_from_old_dates_database(tmp_path, monkeypatch):
+    path = tmp_path / "old.db"
+    make_old_db(path)
+    monkeypatch.setattr(db, "DB_FILE", str(path))
+    run(db.init_db(ADMIN_ID, today=MIGRATION_DAY))
+    assert run(db.get_user(5))["status"] == db.USER_ACTIVE
+
+
+def test_first_superadmin_created_without_test_branch(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DB_FILE", str(tmp_path / "new.db"))
+    run(db.init_db(ADMIN_ID, today=MIGRATION_DAY))
+    admin = run(db.get_user(ADMIN_ID))
+    assert (admin["branch"], admin["role"], admin["status"]) == (db.NO_BRANCH, db.ROLE_SUPERADMIN, db.USER_ACTIVE)
+
+
+def test_test_branch_removed_from_branches():
+    import bot as B
+    assert "Гугл" not in B.BRANCHES
+    assert B.BRANCHES == ["Гагарина", "Абая"]

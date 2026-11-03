@@ -108,8 +108,13 @@ def tg(monkeypatch):
     return fake
 
 
-def register(tg, user_id, name="Иванов Иван", branch="Абая", position="Бариста"):
+def register(tg, user_id, name="Иванов Иван", branch="Абая", position="Бариста", approve=True):
+    """Регистрация через бота; approve — Администратор сразу подтверждает доступ.
+    Возвращает ответы бота на последний шаг (ввод должности)."""
     tg.send(user_id, "/start")
     tg.send(user_id, name)
     tg.press(user_id, f"select_branch:{branch}")
-    tg.send(user_id, position)
+    replies = tg.send(user_id, position)
+    if approve:
+        tg.press(ADMIN_ID, f"reg_ok:{user_id}")
+    return replies
