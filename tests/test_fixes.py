@@ -5,7 +5,7 @@
 """
 import json
 import logging
-from datetime import date, timedelta
+from datetime import timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -14,6 +14,7 @@ from telebot import asyncio_helper
 
 import bot as B
 import db
+import shifts
 from conftest import ADMIN_ID, register, run
 
 WORKER, MANAGER, FOREIGN_WORKER = 222, 333, 555
@@ -72,7 +73,7 @@ def branch(tg):
 
 
 def day(offset: int) -> str:
-    return (date.today() + timedelta(days=offset)).isoformat()
+    return (shifts._today() + timedelta(days=offset)).isoformat()
 
 
 # ---------------------------------------------------------------------
@@ -426,8 +427,9 @@ def test_file_state_storage_survives_restart(tmp_path):
 
 
 def test_state_file_next_to_bot_and_ignored_by_git():
+    import os
     root = Path(B.__file__).resolve().parent
-    assert B.STATE_FILE.parent == root
+    assert B.STATE_FILE.parent == Path(os.environ["DB_FILE"]).parent  # рядом с базой
     assert B.STATE_FILE.name in (root / ".gitignore").read_text(encoding="utf-8")
 
 

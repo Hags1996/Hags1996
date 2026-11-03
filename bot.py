@@ -8,7 +8,7 @@ import pickle
 import re
 import secrets
 import sys
-from datetime import date, timedelta
+from datetime import timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -31,6 +31,7 @@ from telebot.types import (
 )
 
 import db
+import shifts
 from shifts import parse_date, parse_shift, format_date
 from db import ROLE_WORKER, ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN, MANAGEMENT_ROLES
 
@@ -39,7 +40,6 @@ from db import ROLE_WORKER, ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN, MA
 # =====================================================================
 BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "bot.log"
-STATE_FILE = BASE_DIR / "bot_states.pkl"  # состояния FSM переживают перезапуск бота
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 _first_admin = os.getenv("FIRST_SUPERADMIN_ID", "").strip()
@@ -54,6 +54,9 @@ if _LOG_SALT_GENERATED:
     LOG_SALT = secrets.token_hex(16)
 
 logger = logging.getLogger(__name__)
+
+# Состояния FSM — в файле рядом с базой, чтобы перезапуск не обрывал начатые сценарии
+STATE_FILE = Path(db.DB_FILE).parent / "bot_states.pkl"
 
 
 def uid_tag(user_id) -> str:
@@ -249,7 +252,7 @@ async def send_long(chat_id, text: str, **kwargs):
 
 def schedule_period():
     """Период показа расписания: от сегодня на SCHEDULE_DAYS дней (включительно)."""
-    today = date.today()
+    today = shifts._today()
     return today.isoformat(), (today + timedelta(days=SCHEDULE_DAYS - 1)).isoformat()
 
 
@@ -911,8 +914,11 @@ async def process_edit_time(message: telebot.types.Message):
         await bot.send_message(message.chat.id, f"{NO_RIGHTS_TEXT} Смена не сохранена.")
         return
 
-    await db.set_shift(target_id, date_str, shift_time)
-    await bot.send_message(message.chat.id, "✅ Расписание сотрудника успешно обновлено!")
+    closed = await db.set_shift(target_id, date_str, shift_time)
+    text = "✅ Расписание сотрудника успешно обновлено!"
+    if closed:
+        text += f"\nОжидающие заявки сотрудника на эту дату закрыты: {closed}."
+    await bot.send_message(message.chat.id, text)
 
     # Личное уведомление сотруднику
     try:
