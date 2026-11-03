@@ -5,8 +5,8 @@ from datetime import date
 import pytest
 
 import db
-from conftest import ADMIN_ID, register, run
-from shifts import DAY_OFF, format_date, parse_date, parse_shift
+from conftest import ADMIN_ID, FIXED_TODAY, register, run
+from shifts import DAY_OFF, format_date, parse_date, parse_date_nearest, parse_shift
 
 TODAY = date(2026, 10, 4)
 
@@ -24,6 +24,32 @@ TODAY = date(2026, 10, 4)
 ])
 def test_parse_date(text, expected):
     assert parse_date(text, TODAY) == expected
+
+
+@pytest.mark.parametrize("today, expected", [
+    (date(2027, 12, 15), "2028-02-29"),   # в 2027 нет 29.02 — берём 2028
+    (date(2028, 1, 10), "2028-02-29"),
+    (date(2028, 3, 10), "2028-02-29"),    # прошло меньше месяца
+    (date(2026, 10, 4), None),            # ни в 2026, ни в 2027 нет 29.02
+])
+def test_parse_date_feb_29(today, expected):
+    assert parse_date("29.02", today) == expected
+
+
+MIGRATION_DAY = date(2026, 11, 3)
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("01.10", "2026-10-01"),        # прошлый месяц — история, а не следующий год
+    ("15.05", "2026-05-15"),
+    ("20.12", "2026-12-20"),
+    ("15.01", "2027-01-15"),        # январь из ноября — следующий год
+    ("01.10.2025", "2025-10-01"),   # год указан — как есть
+    ("29.02", None),                # в 2025–2027 нет 29.02 — запись не трогаем
+    ("📥 Запросы на изменение", None),
+])
+def test_parse_date_nearest(text, expected):
+    assert parse_date_nearest(text, MIGRATION_DAY) == expected
 
 
 @pytest.mark.parametrize("text, expected", [
@@ -57,7 +83,8 @@ def test_menu_button_is_not_saved_as_date(tg):
     tg.send(222, "8:00-20:00")
     req = run(db.get_pending_requests("Абая"))[0]
     assert req["desired_time"] == "08:00 - 20:00"
-    assert parse_date("25.10") == req["date_str"]
+    assert FIXED_TODAY == date(2026, 10, 4)
+    assert req["date_str"] == "2026-10-25"
 
 
 def test_one_shift_per_day(tg):
@@ -90,14 +117,14 @@ def test_migration_of_old_database(tmp_path, monkeypatch):
     con.close()
 
     monkeypatch.setattr(db, "DB_FILE", str(path))
-    run(db.init_db(ADMIN_ID))
-    run(db.init_db(ADMIN_ID))  # повторный запуск ничего не ломает
+    # миграция через месяц после смены: «01.10» — прошлое, а не 2027 год
+    run(db.init_db(ADMIN_ID, today=MIGRATION_DAY))
+    run(db.init_db(ADMIN_ID, today=MIGRATION_DAY))  # повторный запуск ничего не ломает
 
-    year = date.today().year
     rows = [tuple(r) for r in run(db.get_user_schedule(5))]
-    assert (f"{year}-10-01", "09:00 - 21:00") in rows       # из двух дублей осталась последняя
+    assert ("2026-10-01", "09:00 - 21:00") in rows          # из двух дублей осталась последняя
     assert ("📥 Запросы на изменение", "📢 Глобальная рассылка") in rows  # мусор не удалён молча
     assert len(rows) == 2
     con = sqlite3.connect(path)
-    assert con.execute("SELECT date_str FROM schedule_requests").fetchone()[0] == f"{year}-10-01"
+    assert con.execute("SELECT date_str FROM schedule_requests").fetchone()[0] == "2026-10-01"
     assert con.execute("PRAGMA user_version").fetchone()[0] == 1

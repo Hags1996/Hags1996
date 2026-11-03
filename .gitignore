@@ -13,6 +13,7 @@ ENV/
 *.db
 *.sqlite3
 bot_data.db
+*.db.bak-*
 
 # Sensitive environment variables
 .env

@@ -7,11 +7,19 @@ import asyncio
 import json
 import os
 import sys
+import tempfile
+from datetime import date
 
+import dotenv
 import pytest
 
+# До импорта bot/db: только выдуманные настройки, база — во временной папке.
+# load_dotenv() ищет .env вверх по папкам от bot.py и из копии репозитория
+# дошёл бы до настоящего .env владельца — поэтому отключаем его совсем.
+dotenv.load_dotenv = lambda *args, **kwargs: False
 os.environ["BOT_TOKEN"] = "123456:TEST"
 os.environ["FIRST_SUPERADMIN_ID"] = "111"
+os.environ["DB_FILE"] = os.path.join(tempfile.mkdtemp(prefix="smenabot-tests-"), "import.db")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from telebot import asyncio_filters, asyncio_helper, types  # noqa: E402
@@ -19,11 +27,25 @@ from telebot.asyncio_storage import StateMemoryStorage  # noqa: E402
 
 import bot as B  # noqa: E402
 import db  # noqa: E402
+import shifts  # noqa: E402
 
 B.bot.add_custom_filter(asyncio_filters.StateFilter(B.bot))
 B.bot.add_custom_filter(asyncio_filters.IsDigitFilter())
 
 ADMIN_ID = 111
+# «Сегодня» во всех тестах: «25.10» → 2026-10-25 независимо от дня запуска
+FIXED_TODAY = date(2026, 10, 4)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path, monkeypatch):
+    """Каждый тест — на своей временной базе, боевой bot_data.db не трогается."""
+    monkeypatch.setattr(db, "DB_FILE", str(tmp_path / "test.db"))
+
+
+@pytest.fixture(autouse=True)
+def _frozen_today(monkeypatch):
+    monkeypatch.setattr(shifts, "_today", lambda: FIXED_TODAY)
 
 
 class FakeTelegram:
@@ -78,8 +100,7 @@ def run(coro):
 
 
 @pytest.fixture
-def tg(tmp_path, monkeypatch):
-    monkeypatch.setattr(db, "DB_FILE", str(tmp_path / "test.db"))
+def tg(monkeypatch):
     B.bot.current_states = StateMemoryStorage()
     fake = FakeTelegram()
     monkeypatch.setattr(asyncio_helper, "_process_request", fake.request)

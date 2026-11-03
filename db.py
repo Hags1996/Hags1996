@@ -1,12 +1,32 @@
 """Работа с базой данных SQLite (aiosqlite). Весь SQL бота живёт здесь."""
+import asyncio
+import logging
 import os
+import sqlite3
 from datetime import date
+from pathlib import Path
 
 import aiosqlite
 
-from shifts import parse_date
+import shifts
+from shifts import parse_date_nearest
 
-DB_FILE = os.getenv("DB_FILE", "bot_data.db")
+logger = logging.getLogger(__name__)
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _resolve_db_file(value: str | None) -> str:
+    """Путь к базе. Относительный путь (и путь по умолчанию) — от папки с db.py,
+    а не от текущей папки: иначе бот, запущенный из другого места, создал бы
+    новую пустую базу рядом с собой."""
+    path = Path(value) if value else Path("bot_data.db")
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return str(path)
+
+
+DB_FILE = _resolve_db_file(os.getenv("DB_FILE"))
 
 ROLE_WORKER = "worker"
 ROLE_MANAGER = "manager"
@@ -15,13 +35,29 @@ ROLE_SUPERADMIN = "superadmin"
 
 MANAGEMENT_ROLES = (ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN)
 
+# Значения schedule_requests.status
+REQUEST_PENDING = "PENDING"
+REQUEST_APPROVED = "APPROVED"
+REQUEST_REJECTED = "REJECTED"
+REQUEST_SUPERSEDED = "SUPERSEDED"  # менеджер сам назначил смену на эту дату
+
+_UPSERT_SHIFT_SQL = (
+    "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
+    "ON CONFLICT(user_id, date_str) DO UPDATE SET shift_time = excluded.shift_time"
+)
+
 
 def _connect():
     return aiosqlite.connect(DB_FILE)
 
 
-async def init_db(first_superadmin_id: int):
-    """Создание таблиц базы данных и регистрация первого суперадмина."""
+async def init_db(first_superadmin_id: int, today: date | None = None):
+    """Создание таблиц базы данных и регистрация первого суперадмина.
+
+    today — день миграции (по умолчанию сегодня); параметр нужен тестам.
+    """
+    today = today or shifts._today()
+    await _backup_before_migration(today)
     async with _connect() as db:
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -60,7 +96,7 @@ async def init_db(first_superadmin_id: int):
         await db.execute(
             "INSERT OR IGNORE INTO system_settings (key, value) VALUES ('is_paused', '0')"
         )
-        await _migrate(db)
+        await _migrate(db, today)
 
         if first_superadmin_id:
             async with db.execute("SELECT role FROM users WHERE telegram_id = ?", (first_superadmin_id,)) as cursor:
@@ -75,14 +111,54 @@ async def init_db(first_superadmin_id: int):
         await db.commit()
 
 
-async def _migrate(db):
+def _backup_path(today: date) -> Path:
+    """bot_data.db.bak-ГГГГММДД рядом с базой; существующую копию не перезаписываем."""
+    base = f"{DB_FILE}.bak-{today:%Y%m%d}"
+    path, n = Path(base), 0
+    while path.exists():
+        n += 1
+        path = Path(f"{base}-{n}")
+    return path
+
+
+def _sqlite_backup(src: str, dst: str):
+    """Копия базы средствами SQLite (корректна и при открытой базе). Вызывать в потоке."""
+    source = sqlite3.connect(src)
+    try:
+        target = sqlite3.connect(dst)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+
+async def _backup_before_migration(today: date) -> Path | None:
+    """Если база старая (user_version < 1 и в ней есть таблицы) — копия до миграции."""
+    if not Path(DB_FILE).exists():
+        return None
+    async with _connect() as db:
+        async with db.execute("PRAGMA user_version") as cursor:
+            version = (await cursor.fetchone())[0]
+        async with db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1") as cursor:
+            has_tables = await cursor.fetchone() is not None
+    if version >= 1 or not has_tables:
+        return None
+    target = _backup_path(today)
+    await asyncio.to_thread(_sqlite_backup, DB_FILE, str(target))
+    logger.info("Перед обновлением базы сделана копия: %s", target)
+    return target
+
+
+async def _migrate(db, today: date):
     """Обновление схемы старой базы. Версия хранится в PRAGMA user_version."""
     async with db.execute("PRAGMA user_version") as cursor:
         version = (await cursor.fetchone())[0]
 
     if version < 1:
-        # 1. Даты «ДД.ММ» → «ГГГГ-ММ-ДД». Нераспознанные значения не трогаем.
-        today = date.today()
+        # 1. Даты «ДД.ММ» → «ГГГГ-ММ-ДД», год — ближайший ко дню миграции.
+        #    Нераспознанные значения не трогаем.
         for select_sql, update_sql in (
             ("SELECT id, date_str FROM schedules", "UPDATE schedules SET date_str = ? WHERE id = ?"),
             ("SELECT id, date_str FROM schedule_requests", "UPDATE schedule_requests SET date_str = ? WHERE id = ?"),
@@ -90,7 +166,7 @@ async def _migrate(db):
             async with db.execute(select_sql) as cursor:
                 rows = await cursor.fetchall()
             for row_id, date_str in rows:
-                iso = parse_date(date_str, today)
+                iso = parse_date_nearest(date_str, today)
                 if iso and iso != date_str:
                     await db.execute(update_sql, (iso, row_id))
         # 2. Одна смена на сотрудника в день: оставляем последнюю запись
@@ -227,14 +303,18 @@ async def get_branch_schedule(branch: str, date_from: str | None = None, date_to
     return list(employees.values())
 
 
-async def set_shift(user_id: int, date_str: str, shift_time: str):
+async def set_shift(user_id: int, date_str: str, shift_time: str) -> int:
+    """Назначить смену. Ожидающие заявки сотрудника на эту дату закрываются
+    (SUPERSEDED), чтобы их «Принять» не перетёрло смену от менеджера.
+    Возвращает число закрытых заявок."""
     async with _connect() as db:
-        await db.execute(
-            "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id, date_str) DO UPDATE SET shift_time = excluded.shift_time",
-            (user_id, date_str, shift_time)
+        await db.execute(_UPSERT_SHIFT_SQL, (user_id, date_str, shift_time))
+        cursor = await db.execute(
+            "UPDATE schedule_requests SET status = ? WHERE user_id = ? AND date_str = ? AND status = ?",
+            (REQUEST_SUPERSEDED, user_id, date_str, REQUEST_PENDING)
         )
         await db.commit()
+        return cursor.rowcount
 
 
 # ---------------------------------------------------------------------
@@ -275,23 +355,33 @@ async def get_request_branch(req_id: int):
 
 
 async def decide_request(req_id: int, approve: bool):
-    """Принять/отклонить заявку. Возвращает заявку или None, если она уже обработана."""
+    """Принять/отклонить заявку. Возвращает заявку (Row) или None, если её нет
+    или она уже обработана.
+
+    Два менеджера могут нажать кнопки одновременно: статус меняется условным
+    UPDATE ... AND status = 'PENDING' внутри BEGIN IMMEDIATE, и смену пишет
+    только тот, чей UPDATE изменил строку.
+    """
+    new_status = REQUEST_APPROVED if approve else REQUEST_REJECTED
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM schedule_requests WHERE id = ?", (req_id,)) as cursor:
-            req = await cursor.fetchone()
-        if not req or req['status'] != 'PENDING':
-            return None
-
-        new_status = 'APPROVED' if approve else 'REJECTED'
-        await db.execute("UPDATE schedule_requests SET status = ? WHERE id = ?", (new_status, req_id))
-        if approve:
-            await db.execute(
-                "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
-                "ON CONFLICT(user_id, date_str) DO UPDATE SET shift_time = excluded.shift_time",
-                (req['user_id'], req['date_str'], req['desired_time'])
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "UPDATE schedule_requests SET status = ? WHERE id = ? AND status = ?",
+                (new_status, req_id, REQUEST_PENDING)
             )
-        await db.commit()
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return None
+            async with db.execute("SELECT * FROM schedule_requests WHERE id = ?", (req_id,)) as cursor:
+                req = await cursor.fetchone()
+            if approve:
+                await db.execute(_UPSERT_SHIFT_SQL, (req['user_id'], req['date_str'], req['desired_time']))
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
         return req
 
 
