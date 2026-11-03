@@ -23,7 +23,11 @@ Merge пул-реквеста, push в `main` и деплой — только �
 
 | С | Исполнитель | Ветка | Файлы | Статус |
 | :--- | :--- | :--- | :--- | :--- |
-| 2026-11-03 | аудит (3 агента, только чтение) | — | весь код | идёт |
+| 2026-11-03 | аудит (3 агента, только чтение) | — | весь код | готов, итог в `docs/AUDIT-2026-11-03.md` |
+| 2026-11-03 | исполнитель A | своя копия | `db.py`: миграции, `_connect`/пути, `decide_request`, `set_shift`; `shifts.py`; `tests/conftest.py`, `tests/test_shifts.py`, `tests/test_db.py` | в работе |
+| 2026-11-03 | исполнитель B | своя копия | `bot.py`; в `db.py` только `get_user_schedule`, `get_branch_schedule`, `get_request_recipients`; `tests/test_flows.py` и новые тесты; `README.md`, `.gitignore`, `.env.example` | в работе |
+
+Порядок приёмки: сначала A, затем B поверх A (B опирается на «`decide_request` → `None`, если заявка уже обработана»).
 
 ## Известное
 
