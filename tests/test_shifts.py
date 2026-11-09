@@ -127,4 +127,4 @@ def test_migration_of_old_database(tmp_path, monkeypatch):
     assert len(rows) == 2
     con = sqlite3.connect(path)
     assert con.execute("SELECT date_str FROM schedule_requests").fetchone()[0] == "2026-10-01"
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert con.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION

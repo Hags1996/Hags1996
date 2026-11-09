@@ -41,6 +41,16 @@ REQUEST_APPROVED = "APPROVED"
 REQUEST_REJECTED = "REJECTED"
 REQUEST_SUPERSEDED = "SUPERSEDED"  # менеджер сам назначил смену на эту дату
 
+# Значения users.status
+USER_PENDING = "pending"    # зарегистрировался, ждёт подтверждения Администратора
+USER_ACTIVE = "active"      # работает
+USER_INACTIVE = "inactive"  # уволен / отклонён: доступ закрыт, история остаётся
+
+# Филиал первого Администратора: ему филиал не важен, он выбирает его кнопками
+NO_BRANCH = "—"
+
+SCHEMA_VERSION = 2
+
 _UPSERT_SHIFT_SQL = (
     "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
     "ON CONFLICT(user_id, date_str) DO UPDATE SET shift_time = excluded.shift_time"
@@ -65,7 +75,8 @@ async def init_db(first_superadmin_id: int, today: date | None = None):
                 full_name TEXT NOT NULL,
                 branch TEXT NOT NULL,
                 position TEXT NOT NULL,
-                role TEXT NOT NULL DEFAULT 'worker'
+                role TEXT NOT NULL DEFAULT 'worker',
+                status TEXT NOT NULL DEFAULT 'active'
             )
         """)
         await db.execute("""
@@ -102,11 +113,14 @@ async def init_db(first_superadmin_id: int, today: date | None = None):
             async with db.execute("SELECT role FROM users WHERE telegram_id = ?", (first_superadmin_id,)) as cursor:
                 user = await cursor.fetchone()
             if user:
-                await db.execute("UPDATE users SET role = ? WHERE telegram_id = ?", (ROLE_SUPERADMIN, first_superadmin_id))
+                await db.execute(
+                    "UPDATE users SET role = ?, status = ? WHERE telegram_id = ?",
+                    (ROLE_SUPERADMIN, USER_ACTIVE, first_superadmin_id)
+                )
             else:
                 await db.execute(
-                    "INSERT INTO users (telegram_id, full_name, branch, position, role) VALUES (?, ?, ?, ?, ?)",
-                    (first_superadmin_id, "Главный Администратор", "Гугл", "Суперадмин", ROLE_SUPERADMIN)
+                    "INSERT INTO users (telegram_id, full_name, branch, position, role, status) VALUES (?, ?, ?, ?, ?, ?)",
+                    (first_superadmin_id, "Главный Администратор", NO_BRANCH, "Суперадмин", ROLE_SUPERADMIN, USER_ACTIVE)
                 )
         await db.commit()
 
@@ -135,7 +149,7 @@ def _sqlite_backup(src: str, dst: str):
 
 
 async def _backup_before_migration(today: date) -> Path | None:
-    """Если база старая (user_version < 1 и в ней есть таблицы) — копия до миграции."""
+    """Если база старая (user_version < SCHEMA_VERSION и в ней есть таблицы) — копия до миграции."""
     if not Path(DB_FILE).exists():
         return None
     async with _connect() as db:
@@ -143,7 +157,7 @@ async def _backup_before_migration(today: date) -> Path | None:
             version = (await cursor.fetchone())[0]
         async with db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' LIMIT 1") as cursor:
             has_tables = await cursor.fetchone() is not None
-    if version >= 1 or not has_tables:
+    if version >= SCHEMA_VERSION or not has_tables:
         return None
     target = _backup_path(today)
     await asyncio.to_thread(_sqlite_backup, DB_FILE, str(target))
@@ -180,6 +194,16 @@ async def _migrate(db, today: date):
         )
         await db.execute("PRAGMA user_version = 1")
 
+    if version < 2:
+        # Статус пользователя. Все, кто уже есть в базе, — работают (active).
+        async with db.execute("PRAGMA table_info(users)") as cursor:
+            columns = {row[1] for row in await cursor.fetchall()}
+        if "status" not in columns:
+            await db.execute("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+        await db.execute("UPDATE users SET status = ?", (USER_ACTIVE,))
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_users_branch_status ON users(branch, status)")
+        await db.execute("PRAGMA user_version = 2")
+
 
 # ---------------------------------------------------------------------
 # Пользователи
@@ -191,13 +215,84 @@ async def get_user(telegram_id: int):
             return await cursor.fetchone()
 
 
-async def add_user(telegram_id: int, full_name: str, branch: str, position: str, role: str = ROLE_WORKER):
+async def add_user(telegram_id: int, full_name: str, branch: str, position: str,
+                   role: str = ROLE_WORKER, status: str = USER_ACTIVE):
     async with _connect() as db:
         await db.execute(
-            "INSERT OR REPLACE INTO users (telegram_id, full_name, branch, position, role) VALUES (?, ?, ?, ?, ?)",
-            (telegram_id, full_name, branch, position, role)
+            "INSERT OR REPLACE INTO users (telegram_id, full_name, branch, position, role, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (telegram_id, full_name, branch, position, role, status)
         )
         await db.commit()
+
+
+async def decide_registration(telegram_id: int, approve: bool):
+    """Подтвердить (active) или отклонить (inactive) заявку на доступ.
+
+    Условный UPDATE ... AND status = 'pending': из двух одновременных нажатий
+    срабатывает одно. Возвращает пользователя (Row) или None, если заявка
+    уже обработана или такого пользователя нет."""
+    new_status = USER_ACTIVE if approve else USER_INACTIVE
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "UPDATE users SET status = ? WHERE telegram_id = ? AND status = ?",
+            (new_status, telegram_id, USER_PENDING)
+        )
+        await db.commit()
+        if cursor.rowcount != 1:
+            return None
+        async with db.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)) as cursor:
+            return await cursor.fetchone()
+
+
+async def deactivate_user(telegram_id: int) -> int | None:
+    """Сделать сотрудника неактивным и закрыть (REJECTED) его ожидающие заявки.
+    Смены и история остаются.
+
+    Последнего активного Администратора деактивировать нельзя — проверка в том же
+    условном UPDATE, поэтому два Администратора не выключат друг друга одновременно.
+    Возвращает число закрытых заявок или None, если статус не изменён
+    (уже неактивен, ждёт подтверждения, последний Администратор, нет такого)."""
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await db.execute(
+                "UPDATE users SET status = ? WHERE telegram_id = ? AND status = ? "
+                "AND (role != ? OR (SELECT COUNT(*) FROM users WHERE role = ? AND status = ?) > 1)",
+                (USER_INACTIVE, telegram_id, USER_ACTIVE, ROLE_SUPERADMIN, ROLE_SUPERADMIN, USER_ACTIVE)
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return None
+            cursor = await db.execute(
+                "UPDATE schedule_requests SET status = ? WHERE user_id = ? AND status = ?",
+                (REQUEST_REJECTED, telegram_id, REQUEST_PENDING)
+            )
+            closed = cursor.rowcount
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return closed
+
+
+async def activate_user(telegram_id: int) -> bool:
+    """Вернуть неактивного сотрудника в работу. False — он не был неактивным."""
+    async with _connect() as db:
+        cursor = await db.execute(
+            "UPDATE users SET status = ? WHERE telegram_id = ? AND status = ?",
+            (USER_ACTIVE, telegram_id, USER_INACTIVE)
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def set_user_branch(telegram_id: int, branch: str) -> bool:
+    async with _connect() as db:
+        cursor = await db.execute("UPDATE users SET branch = ? WHERE telegram_id = ?", (branch, telegram_id))
+        await db.commit()
+        return cursor.rowcount == 1
 
 
 async def update_user_role(telegram_id: int, role: str):
@@ -206,24 +301,41 @@ async def update_user_role(telegram_id: int, role: str):
         await db.commit()
 
 
-async def count_superadmins() -> int:
+async def count_superadmins(active_only: bool = False) -> int:
+    """Число Администраторов; active_only — только активных."""
     async with _connect() as db:
-        async with db.execute("SELECT COUNT(*) FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
+        async with db.execute(
+            "SELECT COUNT(*) FROM users WHERE role = ? AND (? = 0 OR status = ?)",
+            (ROLE_SUPERADMIN, int(active_only), USER_ACTIVE)
+        ) as cursor:
             res = await cursor.fetchone()
             return res[0] if res else 0
 
 
 async def get_all_users():
+    """Все пользователи, с любым статусом."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM users") as cursor:
             return await cursor.fetchall()
 
 
-async def get_branch_users(branch: str):
+async def get_active_users():
+    """Активные пользователи — для рассылки и оповещения о паузе."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE branch = ?", (branch,)) as cursor:
+        async with db.execute("SELECT * FROM users WHERE status = ?", (USER_ACTIVE,)) as cursor:
+            return await cursor.fetchall()
+
+
+async def get_branch_users(branch: str, status: str = USER_ACTIVE):
+    """Сотрудники филиала с данным статусом (по умолчанию — активные), по ФИО."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE branch = ? AND status = ? ORDER BY full_name",
+            (branch, status)
+        ) as cursor:
             return await cursor.fetchall()
 
 
@@ -231,32 +343,42 @@ async def get_managers_and_admins(branch: str):
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?)",
-            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN)
+            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?) AND status = ?",
+            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN, USER_ACTIVE)
         ) as cursor:
             return await cursor.fetchall()
 
 
 async def get_superadmins():
-    async with _connect() as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
-            return await cursor.fetchall()
-
-
-async def get_request_recipients(branch: str):
-    """Кому доставить заявку сотрудника: Менеджеры и Управляющие филиала,
-    а если их в филиале нет — Администраторы (чтобы заявка не терялась)."""
+    """Активные Администраторы."""
     async with _connect() as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?)",
-            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN)
+            "SELECT * FROM users WHERE role = ? AND status = ?", (ROLE_SUPERADMIN, USER_ACTIVE)
+        ) as cursor:
+            return await cursor.fetchall()
+
+
+async def get_request_recipients(branch: str, exclude_id: int | None = None):
+    """Кому доставить заявку сотрудника: активные Менеджеры и Управляющие филиала,
+    а если их в филиале нет — активные Администраторы (чтобы заявка не терялась).
+
+    exclude_id — автор заявки: свою заявку руководитель не получает и решать не может.
+    """
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE branch = ? AND role IN (?, ?) AND status = ? "
+            "AND (? IS NULL OR telegram_id != ?)",
+            (branch, ROLE_MANAGER, ROLE_BRANCH_ADMIN, USER_ACTIVE, exclude_id, exclude_id)
         ) as cursor:
             rows = await cursor.fetchall()
         if rows:
             return rows
-        async with db.execute("SELECT * FROM users WHERE role = ?", (ROLE_SUPERADMIN,)) as cursor:
+        async with db.execute(
+            "SELECT * FROM users WHERE role = ? AND status = ? AND (? IS NULL OR telegram_id != ?)",
+            (ROLE_SUPERADMIN, USER_ACTIVE, exclude_id, exclude_id)
+        ) as cursor:
             return await cursor.fetchall()
 
 
@@ -290,9 +412,9 @@ async def get_branch_schedule(branch: str, date_from: str | None = None, date_to
             LEFT JOIN schedules s ON s.user_id = u.telegram_id
                 AND (? IS NULL OR s.date_str >= ?)
                 AND (? IS NULL OR s.date_str <= ?)
-            WHERE u.branch = ?
+            WHERE u.branch = ? AND u.status = ?
             ORDER BY u.telegram_id, s.date_str
-        """, (date_from, date_from, date_to, date_to, branch)) as cursor:
+        """, (date_from, date_from, date_to, date_to, branch, USER_ACTIVE)) as cursor:
             rows = await cursor.fetchall()
 
     employees = {}
@@ -337,8 +459,8 @@ async def get_pending_requests(branch: str):
             SELECT sr.id, sr.user_id, sr.date_str, sr.desired_time, u.full_name, u.position
             FROM schedule_requests sr
             JOIN users u ON sr.user_id = u.telegram_id
-            WHERE u.branch = ? AND sr.status = 'PENDING'
-        """, (branch,)) as cursor:
+            WHERE u.branch = ? AND sr.status = ? AND u.status = ?
+        """, (branch, REQUEST_PENDING, USER_ACTIVE)) as cursor:
             return await cursor.fetchall()
 
 
@@ -352,6 +474,18 @@ async def get_request_branch(req_id: int):
         """, (req_id,)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else None
+
+
+async def get_request_info(req_id: int):
+    """Автор заявки и его филиал: Row(user_id, branch) или None, если заявки нет."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("""
+            SELECT sr.user_id, u.branch FROM schedule_requests sr
+            JOIN users u ON sr.user_id = u.telegram_id
+            WHERE sr.id = ?
+        """, (req_id,)) as cursor:
+            return await cursor.fetchone()
 
 
 async def decide_request(req_id: int, approve: bool):
