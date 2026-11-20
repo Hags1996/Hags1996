@@ -276,6 +276,23 @@ async def get_user_schedule(user_id: int, date_from: str | None = None, date_to:
             return await cursor.fetchall()
 
 
+async def get_user_shifts_for_month(user_id: int, year: int, month: int) -> set[str]:
+    """Набор дат (ISO «ГГГГ-ММ-ДД») со сменами пользователя в данном месяце.
+    Используется для маркировки занятых дней в inline-календаре."""
+    date_from = f"{year:04d}-{month:02d}-01"
+    # последний день месяца через переполнение: месяц+1 день 0 = последний день месяца
+    import calendar as _c
+    last_day = _c.monthrange(year, month)[1]
+    date_to = f"{year:04d}-{month:02d}-{last_day:02d}"
+    async with _connect() as db:
+        async with db.execute(
+            "SELECT date_str FROM schedules WHERE user_id = ? AND date_str >= ? AND date_str <= ?",
+            (user_id, date_from, date_to)
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return {row[0] for row in rows}
+
+
 async def get_branch_schedule(branch: str, date_from: str | None = None, date_to: str | None = None):
     """Сотрудники филиала и их смены одним запросом: [{full_name, position, shifts}].
 

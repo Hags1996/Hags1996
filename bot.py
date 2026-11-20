@@ -1,4 +1,6 @@
 import asyncio
+import calendar as _cal
+import datetime
 import hashlib
 import hmac
 import html
@@ -105,6 +107,12 @@ class FileStateStorage(StatePickleStorage):
         with open(tmp, "wb") as f:
             pickle.dump(data, f)
         os.replace(tmp, self.file_path)
+
+    async def set_state(self, chat_id, user_id, state, *args, **kwargs):
+        # как хранилище в памяти: записываем название шага, а не объект
+        if hasattr(state, "name"):
+            state = state.name
+        return await super().set_state(chat_id, user_id, state, *args, **kwargs)
 
 
 # Хранилище в памяти до запуска; main() подключает файловое (тесты работают без файла)
@@ -336,6 +344,539 @@ def get_request_keyboard(req_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("❌ Отклонить", callback_data=f"rej_req:{req_id}")
     )
     return markup
+
+# =====================================================================
+# INLINE-КАЛЕНДАРЬ (стиль Android / MIUI)
+# Префиксы: cal_nav:, cal_pick:, cal_today:, cal_set:, cal_c:, cal_to_req:, cal_noop
+# =====================================================================
+_MONTH_NAMES = [
+    "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+]
+_WEEKDAY_NAMES_FULL = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+
+QUICK_SHIFTS = [
+    ("☀️ 08:00 - 20:00", "08:00 - 20:00"),
+    ("🌙 10:00 - 22:00", "10:00 - 22:00"),
+    ("☕️ 09:00 - 21:00", "09:00 - 21:00"),
+    ("🏖 Выходной", "Выходной"),
+]
+
+
+def build_calendar_keyboard(
+    year: int,
+    month: int,
+    context: str,  # "view", "req", "edit"
+    target_id: int | None = None,
+    busy_dates: set[str] | None = None,
+    selected_date: str | None = None,
+    has_shift: bool = False,
+) -> InlineKeyboardMarkup:
+    """Inline-клавиатура в виде Android-календаря с быстрыми кнопками смен под ним."""
+    busy_dates = busy_dates or set()
+    today = shifts._today()
+    markup = InlineKeyboardMarkup(row_width=7)
+    tid_str = str(target_id) if target_id else ""
+
+    # ── Шапка: ◀️  Ноябрь 2026  ▶️ ──────────────────────────────────
+    if month == 1:
+        prev_y, prev_m = year - 1, 12
+    else:
+        prev_y, prev_m = year, month - 1
+    if month == 12:
+        next_y, next_m = year + 1, 1
+    else:
+        next_y, next_m = year, month + 1
+
+    can_go_prev = (prev_y, prev_m) >= (today.year, today.month) or context == "view"
+    prev_data = f"cal_nav:{context}:{tid_str}:{prev_y}:{prev_m}" if can_go_prev else "cal_noop"
+    next_data = f"cal_nav:{context}:{tid_str}:{next_y}:{next_m}"
+
+    markup.row(
+        InlineKeyboardButton("◀️", callback_data=prev_data),
+        InlineKeyboardButton(f"{_MONTH_NAMES[month]} {year}", callback_data="cal_noop"),
+        InlineKeyboardButton("▶️", callback_data=next_data),
+    )
+
+    # ── Строка дней недели ───────────────────────────────────────────
+    markup.row(*[
+        InlineKeyboardButton(d, callback_data="cal_noop")
+        for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    ])
+
+    # ── Сетка чисел ─────────────────────────────────────────────────
+    first_weekday, days_in_month = _cal.monthrange(year, month)
+    row: list[InlineKeyboardButton] = [
+        InlineKeyboardButton(" ", callback_data="cal_noop")
+        for _ in range(first_weekday)
+    ]
+    for day in range(1, days_in_month + 1):
+        d = datetime.date(year, month, day)
+        iso = d.isoformat()
+        label = str(day)
+
+        if iso == selected_date:
+            label = f"[{day}]"
+        elif iso in busy_dates:
+            label = f"{day}•"
+        if d == today and iso != selected_date:
+            label = f"·{label}·"
+
+        if d < today and context in ("req", "edit"):
+            btn = InlineKeyboardButton(label, callback_data="cal_noop")
+        else:
+            btn = InlineKeyboardButton(label, callback_data=f"cal_pick:{context}:{tid_str}:{iso}")
+
+        row.append(btn)
+        if len(row) == 7:
+            markup.row(*row)
+            row = []
+
+    if row:
+        row += [InlineKeyboardButton(" ", callback_data="cal_noop")] * (7 - len(row))
+        markup.row(*row)
+
+    # ── Кнопки смены расписания прямо под календарем ─────────────────
+    if selected_date:
+        if context in ("req", "edit"):
+            markup.row(
+                InlineKeyboardButton(QUICK_SHIFTS[0][0], callback_data=f"cal_set:{context}:{tid_str}:{selected_date}:{QUICK_SHIFTS[0][1]}"),
+                InlineKeyboardButton(QUICK_SHIFTS[1][0], callback_data=f"cal_set:{context}:{tid_str}:{selected_date}:{QUICK_SHIFTS[1][1]}"),
+            )
+            markup.row(
+                InlineKeyboardButton(QUICK_SHIFTS[2][0], callback_data=f"cal_set:{context}:{tid_str}:{selected_date}:{QUICK_SHIFTS[2][1]}"),
+                InlineKeyboardButton(QUICK_SHIFTS[3][0], callback_data=f"cal_set:{context}:{tid_str}:{selected_date}:{QUICK_SHIFTS[3][1]}"),
+            )
+            markup.row(
+                InlineKeyboardButton("✍️ Ввести другое время", callback_data=f"cal_c:{context}:{tid_str}:{selected_date}")
+            )
+        elif context == "view":
+            if selected_date >= today.isoformat():
+                if has_shift:
+                    markup.row(
+                        InlineKeyboardButton("✏️ Изменить смену", callback_data=f"cal_to_req:{selected_date}"),
+                        InlineKeyboardButton("🏖 Запросить выходной", callback_data=f"cal_set:req::{selected_date}:Выходной"),
+                    )
+                else:
+                    markup.row(
+                        InlineKeyboardButton("➕ Добавить смену на эту дату", callback_data=f"cal_to_req:{selected_date}")
+                    )
+
+    # ── Нижняя панель ────────────────────────────────────────────────
+    markup.row(
+        InlineKeyboardButton("📍 Сегодня", callback_data=f"cal_today:{context}:{tid_str}"),
+        InlineKeyboardButton("❌ Закрыть" if context == "view" else "❌ Отмена", callback_data="cancel_action"),
+    )
+    return markup
+
+
+def _calendar_day_text(iso: str, shift_time: str | None, employee_name: str | None = None) -> str:
+    """Форматированный заголовок даты и события снизу."""
+    try:
+        d = datetime.date.fromisoformat(iso)
+    except ValueError:
+        return iso
+    weekday = _WEEKDAY_NAMES_FULL[d.weekday()]
+    month_name = _MONTH_NAMES[d.month].lower()
+
+    header = ""
+    if employee_name:
+        header = f"👤 <b>Сотрудник:</b> {esc(employee_name)}\n"
+
+    date_line = f"📅 <b>{weekday}, {d.day} {month_name} {d.year}</b>"
+
+    if shift_time and shift_time.lower() != "выходной":
+        shift_line = f"🕐 <b>Смена:</b> <code>{esc(shift_time)}</code>"
+    elif shift_time and shift_time.lower() == "выходной":
+        shift_line = "🏖 <b>Выходной</b>"
+    else:
+        shift_line = "<i>Смен на этот день нет</i>"
+
+    return f"{header}{date_line}\n\n{shift_line}"
+
+
+async def submit_schedule_request(user_id: int, date_str: str, desired_time: str) -> tuple[int, int]:
+    """Создаёт заявку и рассылает её руководителям филиала. Возвращает (req_id, delivered)."""
+    user = await db.get_user(user_id)
+    if not user:
+        return 0, 0
+    req_id = await db.create_request(user_id, date_str, desired_time)
+    recipients = await db.get_request_recipients(user['branch'])
+    delivered = 0
+    for mgr in recipients:
+        try:
+            await bot.send_message(
+                mgr['telegram_id'],
+                f"📩 <b>Новый запрос на изменение расписания!</b>\n\n"
+                f"<b>Сотрудник:</b> {esc(user['full_name'])} ({esc(user['position'])})\n"
+                f"<b>Филиал:</b> {esc(user['branch'])}\n"
+                f"<b>Дата:</b> {esc(format_date(date_str))}\n"
+                f"<b>Желаемое время:</b> {esc(desired_time)}",
+                parse_mode="HTML",
+                reply_markup=get_request_keyboard(req_id)
+            )
+            delivered += 1
+        except Exception as e:
+            logger.error("Не удалось отправить заявку руководителю %s (%s)", uid_tag(mgr['telegram_id']), type(e).__name__)
+    return req_id, delivered
+
+
+async def apply_manager_shift(manager_id: int, target_id: int, date_str: str, shift_time: str) -> tuple[bool, str, int]:
+    """Назначает смену сотруднику от лица менеджера. Возвращает (success, target_name_or_error, closed_reqs)."""
+    manager = await get_user_with_role(manager_id, MANAGEMENT_ROLES)
+    target = await db.get_user(target_id)
+    if not manager or not target or not can_manage_branch(manager, target['branch']):
+        return False, NO_RIGHTS_TEXT, 0
+
+    closed = await db.set_shift(target_id, date_str, shift_time)
+    try:
+        await bot.send_message(
+            target_id,
+            f"🔔 Ваше расписание на [{format_date(date_str)}] было изменено: новое время [{shift_time}]."
+        )
+    except Exception as e:
+        logger.error("Не удалось уведомить сотрудника %s о смене (%s)", uid_tag(target_id), type(e).__name__)
+    return True, target['full_name'], closed
+
+
+# ── Обработчик: нажатие пустышки ──────────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data == "cal_noop")
+async def calendar_noop(call: telebot.types.CallbackQuery):
+    await bot.answer_callback_query(call.id)
+
+
+# ── Обработчик: листание месяца ◀️ / ▶️ ────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cal_nav:"))
+async def calendar_navigate(call: telebot.types.CallbackQuery):
+    # cal_nav:context:target_id:year:month
+    parts = call.data.split(":", 4)
+    if len(parts) != 5:
+        await bot.answer_callback_query(call.id)
+        return
+    _, context, target_id_str, raw_y, raw_m = parts
+    target_id = int(target_id_str) if target_id_str.isdigit() else None
+    try:
+        year, month = int(raw_y), int(raw_m)
+    except ValueError:
+        await bot.answer_callback_query(call.id)
+        return
+
+    today = shifts._today()
+    if (year, month) < (today.year, today.month) and context in ("req", "edit"):
+        await bot.answer_callback_query(call.id, "Нельзя перейти в прошлый месяц")
+        return
+
+    await bot.answer_callback_query(call.id)
+    emp_id = target_id if (context == "edit" and target_id) else call.from_user.id
+    busy = await db.get_user_shifts_for_month(emp_id, year, month)
+
+    try:
+        await bot.edit_message_reply_markup(
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=build_calendar_keyboard(year, month, context, target_id=target_id, busy_dates=busy),
+        )
+    except Exception as e:
+        logger.debug("cal_nav: edit failed (%s)", type(e).__name__)
+
+
+# ── Обработчик: кнопка «📍 Сегодня» ───────────────────────────────
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cal_today:"))
+async def calendar_today(call: telebot.types.CallbackQuery):
+    # cal_today:context:target_id
+    parts = call.data.split(":", 2)
+    context = parts[1] if len(parts) >= 2 else "view"
+    target_id_str = parts[2] if len(parts) >= 3 else ""
+    target_id = int(target_id_str) if target_id_str.isdigit() else None
+
+    today = shifts._today()
+    today_iso = today.isoformat()
+    await bot.answer_callback_query(call.id)
+
+    emp_id = target_id if (context == "edit" and target_id) else call.from_user.id
+    target_user = await db.get_user(emp_id)
+    emp_name = target_user['full_name'] if target_user else None
+
+    rows = await db.get_user_schedule(emp_id, today_iso, today_iso)
+    current_shift = rows[0]["shift_time"] if rows else None
+    busy = await db.get_user_shifts_for_month(emp_id, today.year, today.month)
+
+    new_kb = build_calendar_keyboard(
+        today.year, today.month, context,
+        target_id=target_id,
+        busy_dates=busy, selected_date=today_iso,
+        has_shift=(current_shift is not None),
+    )
+
+    day_text = _calendar_day_text(today_iso, current_shift, employee_name=emp_name if context == "edit" else None)
+    if context in ("req", "edit"):
+        day_text += "\n\n👇 <b>Выберите время смены кнопкой ниже:</b>"
+    else:
+        day_text += "\n\n<i>Нажмите на число в календаре, чтобы посмотреть смену</i>"
+
+    try:
+        await bot.edit_message_text(
+            day_text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=new_kb,
+        )
+    except Exception as e:
+        logger.debug("cal_today: edit failed (%s)", type(e).__name__)
+
+
+# ── Обработчик: выбор конкретного дня в календаре ─────────────────
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cal_pick:"))
+async def calendar_pick_date(call: telebot.types.CallbackQuery):
+    # cal_pick:context:target_id:iso
+    parts = call.data.split(":", 3)
+    if len(parts) != 4:
+        await bot.answer_callback_query(call.id)
+        return
+    _, context, target_id_str, iso = parts
+    target_id = int(target_id_str) if target_id_str.isdigit() else None
+
+    try:
+        picked = datetime.date.fromisoformat(iso)
+    except ValueError:
+        await bot.answer_callback_query(call.id, "Неверная дата")
+        return
+
+    today = shifts._today()
+    if picked < today and context in ("req", "edit"):
+        await bot.answer_callback_query(call.id, "Нельзя выбрать прошедшую дату", show_alert=True)
+        return
+
+    await bot.answer_callback_query(call.id)
+
+    emp_id = target_id if (context == "edit" and target_id) else call.from_user.id
+    target_user = await db.get_user(emp_id)
+    emp_name = target_user['full_name'] if target_user else None
+
+    rows = await db.get_user_schedule(emp_id, iso, iso)
+    current_shift = rows[0]["shift_time"] if rows else None
+    busy = await db.get_user_shifts_for_month(emp_id, picked.year, picked.month)
+
+    new_kb = build_calendar_keyboard(
+        picked.year, picked.month, context,
+        target_id=target_id,
+        busy_dates=busy, selected_date=iso,
+        has_shift=(current_shift is not None),
+    )
+
+    day_text = _calendar_day_text(iso, current_shift, employee_name=emp_name if context == "edit" else None)
+    if context in ("req", "edit"):
+        day_text += "\n\n👇 <b>Выберите время смены кнопкой ниже:</b>"
+    else:
+        day_text += "\n\n<i>Нажмите на число в календаре, чтобы посмотреть смену</i>"
+
+    try:
+        await bot.edit_message_text(
+            day_text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=new_kb,
+        )
+    except Exception as e:
+        logger.debug("cal_pick edit_message_text failed (%s)", type(e).__name__)
+
+    # Сохраняем дату в FSM на случай, если пользователь решит ввести время текстом
+    if context == "req":
+        await bot.set_state(call.from_user.id, RequestScheduleState.desired_time, call.message.chat.id)
+        async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
+            data["date_str"] = iso
+    elif context == "edit" and target_id:
+        await bot.set_state(call.from_user.id, EditScheduleState.shift_time, call.message.chat.id)
+        async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
+            data["target_user_id"] = target_id
+            data["date_str"] = iso
+
+
+# ── Обработчик: прямое нажатие кнопки смены (08:00 - 20:00 и др.) ──
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cal_set:"))
+async def calendar_set_shift(call: telebot.types.CallbackQuery):
+    # cal_set:context:target_id:iso:shift_time
+    parts = call.data.split(":", 4)
+    if len(parts) != 5:
+        await bot.answer_callback_query(call.id, BAD_CALLBACK_TEXT)
+        return
+    _, context, target_id_str, iso, shift_time = parts
+
+    try:
+        picked = datetime.date.fromisoformat(iso)
+    except ValueError:
+        await bot.answer_callback_query(call.id, "Неверная дата")
+        return
+
+    today = shifts._today()
+    if picked < today:
+        await bot.answer_callback_query(call.id, "Нельзя изменить смену в прошлом!", show_alert=True)
+        return
+
+    if context == "req":
+        user = await db.get_user(call.from_user.id)
+        if not user:
+            await bot.answer_callback_query(call.id, NOT_REGISTERED_TEXT, show_alert=True)
+            return
+
+        await bot.delete_state(call.from_user.id, call.message.chat.id)
+        req_id, delivered = await submit_schedule_request(call.from_user.id, iso, shift_time)
+        await bot.answer_callback_query(call.id, "✅ Запрос отправлен!")
+
+        confirm_text = (
+            f"✅ <b>Запрос на изменение расписания отправлен!</b>\n\n"
+            f"📅 <b>Дата:</b> {format_date(iso)}\n"
+            f"⏰ <b>Желаемое время:</b> <code>{esc(shift_time)}</code>\n\n"
+            f"<i>Заявка №{req_id} передана руководству филиала «{esc(user['branch'])}».</i>"
+        )
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🗓 Открыть календарь", callback_data=f"cal_pick:view::{iso}"))
+        markup.add(InlineKeyboardButton("❌ Закрыть", callback_data="cancel_action"))
+        try:
+            await bot.edit_message_text(
+                confirm_text,
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as e:
+            logger.debug("cal_set req: edit failed (%s)", type(e).__name__)
+
+    elif context == "edit":
+        target_id = int(target_id_str) if target_id_str.isdigit() else 0
+        if not target_id:
+            await bot.answer_callback_query(call.id, "Ошибка сотрудника", show_alert=True)
+            return
+
+        ok, target_name, closed = await apply_manager_shift(call.from_user.id, target_id, iso, shift_time)
+        if not ok:
+            await bot.answer_callback_query(call.id, target_name, show_alert=True)
+            return
+
+        await bot.delete_state(call.from_user.id, call.message.chat.id)
+        await bot.answer_callback_query(call.id, "✅ Смена сохранена!")
+
+        confirm_text = (
+            f"✅ <b>Расписание сотрудника успешно обновлено!</b>\n\n"
+            f"👤 <b>Сотрудник:</b> {esc(target_name)}\n"
+            f"📅 <b>Дата:</b> {format_date(iso)}\n"
+            f"⏰ <b>Новое время:</b> <code>{esc(shift_time)}</code>"
+        )
+        if closed:
+            confirm_text += f"\n<i>Ожидающие заявки сотрудника на эту дату закрыты ({closed}).</i>"
+
+        markup = InlineKeyboardMarkup()
+        markup.add(InlineKeyboardButton("🗓 Вернуться к календарю", callback_data=f"cal_pick:edit:{target_id}:{iso}"))
+        markup.add(InlineKeyboardButton("❌ Закрыть", callback_data="cancel_action"))
+        try:
+            await bot.edit_message_text(
+                confirm_text,
+                call.message.chat.id,
+                call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=markup,
+            )
+        except Exception as e:
+            logger.debug("cal_set edit: edit failed (%s)", type(e).__name__)
+
+
+# ── Обработчик: переход из режима просмотра к запросу смены ────────
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cal_to_req:"))
+async def calendar_switch_to_request(call: telebot.types.CallbackQuery):
+    # cal_to_req:iso
+    parts = call.data.split(":", 1)
+    if len(parts) != 2:
+        await bot.answer_callback_query(call.id)
+        return
+    iso = parts[1]
+    try:
+        picked = datetime.date.fromisoformat(iso)
+    except ValueError:
+        await bot.answer_callback_query(call.id, "Неверная дата")
+        return
+
+    today = shifts._today()
+    if picked < today:
+        await bot.answer_callback_query(call.id, "Нельзя изменить смену в прошлом!", show_alert=True)
+        return
+
+    await bot.answer_callback_query(call.id)
+    user_id = call.from_user.id
+    rows = await db.get_user_schedule(user_id, iso, iso)
+    current_shift = rows[0]["shift_time"] if rows else None
+    busy = await db.get_user_shifts_for_month(user_id, picked.year, picked.month)
+
+    new_kb = build_calendar_keyboard(
+        picked.year, picked.month, "req",
+        busy_dates=busy, selected_date=iso,
+        has_shift=(current_shift is not None),
+    )
+
+    day_text = (
+        _calendar_day_text(iso, current_shift) + "\n\n"
+        "👇 <b>Выберите желаемое время смены кнопкой ниже:</b>"
+    )
+
+    try:
+        await bot.edit_message_text(
+            day_text,
+            call.message.chat.id,
+            call.message.message_id,
+            parse_mode="HTML",
+            reply_markup=new_kb,
+        )
+    except Exception as e:
+        logger.debug("cal_to_req failed (%s)", type(e).__name__)
+
+    await bot.set_state(call.from_user.id, RequestScheduleState.desired_time, call.message.chat.id)
+    async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
+        data["date_str"] = iso
+
+
+# ── Обработчик: запрос ввода времени текстом вручную ───────────────
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cal_c:"))
+async def calendar_custom_input(call: telebot.types.CallbackQuery):
+    # cal_c:context:target_id:iso
+    parts = call.data.split(":", 3)
+    if len(parts) != 4:
+        await bot.answer_callback_query(call.id)
+        return
+    _, context, target_id_str, iso = parts
+    target_id = int(target_id_str) if target_id_str.isdigit() else None
+
+    await bot.answer_callback_query(call.id)
+
+    markup = InlineKeyboardMarkup()
+    back_target = target_id_str if target_id else ""
+    markup.add(
+        InlineKeyboardButton("◀️ Назад к выбору кнопок", callback_data=f"cal_pick:{context}:{back_target}:{iso}"),
+        InlineKeyboardButton("❌ Отмена", callback_data="cancel_action"),
+    )
+
+    if context == "req":
+        await bot.set_state(call.from_user.id, RequestScheduleState.desired_time, call.message.chat.id)
+        async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
+            data["date_str"] = iso
+    elif context == "edit" and target_id:
+        await bot.set_state(call.from_user.id, EditScheduleState.shift_time, call.message.chat.id)
+        async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
+            data["target_user_id"] = target_id
+            data["date_str"] = iso
+
+    await bot.edit_message_text(
+        f"📅 Дата: <b>{format_date(iso)}</b>\n\n"
+        "⏰ <b>Введите время смены в чат:</b>\n"
+        "например: <code>12:00 - 18:00</code> или <code>Выходной</code>\n\n"
+        "<i>Для отмены введите /cancel</i>",
+        call.message.chat.id,
+        call.message.message_id,
+        parse_mode="HTML",
+        reply_markup=markup,
+    )
+
 
 # =====================================================================
 # МИДДЛВЕЙР ПРОВЕРКИ ПАУЗЫ БОТА
@@ -609,18 +1150,28 @@ async def process_position(message: telebot.types.Message):
 # =====================================================================
 @bot.message_handler(func=lambda m: m.text == BTN_MY_SCHEDULE)
 async def view_my_schedule(message: telebot.types.Message):
-    date_from, date_to = schedule_period()
-    schedules = await db.get_user_schedule(message.from_user.id, date_from, date_to)
-    period = f"{format_date(date_from)} — {format_date(date_to)}"
-    if not schedules:
-        await bot.send_message(message.chat.id, f"У вас нет смен на ближайшие {SCHEDULE_DAYS} дней ({period}).")
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        await bot.send_message(message.chat.id, NOT_REGISTERED_TEXT)
         return
 
-    text = f"🗓 <b>Ваше расписание</b> ({period}):\n\n"
-    for s in schedules:
-        text += f"• <b>{esc(format_date(s['date_str']))}:</b> <code>{esc(s['shift_time'])}</code>\n"
+    today = shifts._today()
+    today_iso = today.isoformat()
+    busy = await db.get_user_shifts_for_month(message.from_user.id, today.year, today.month)
+    rows = await db.get_user_schedule(message.from_user.id, today_iso, today_iso)
+    current_shift = rows[0]["shift_time"] if rows else None
 
-    await send_long(message.chat.id, text, parse_mode="HTML")
+    text = (
+        "🗓 <b>Ваше расписание</b>\n\n"
+        + _calendar_day_text(today_iso, current_shift) + "\n\n"
+        "<i>Нажмите на число в календаре, чтобы посмотреть смену</i>"
+    )
+    kb = build_calendar_keyboard(
+        today.year, today.month, "view",
+        busy_dates=busy, selected_date=today_iso,
+        has_shift=(current_shift is not None),
+    )
+    await bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == BTN_REQUEST)
 async def start_request_schedule(message: telebot.types.Message):
@@ -628,13 +1179,33 @@ async def start_request_schedule(message: telebot.types.Message):
         await bot.send_message(message.chat.id, NOT_REGISTERED_TEXT)
         return
 
+    today = shifts._today()
+    today_iso = today.isoformat()
+    busy = await db.get_user_shifts_for_month(message.from_user.id, today.year, today.month)
+    rows = await db.get_user_schedule(message.from_user.id, today_iso, today_iso)
+    current_shift = rows[0]["shift_time"] if rows else None
+
+    # Устанавливаем состояние до отправки
+    await bot.set_state(message.from_user.id, RequestScheduleState.desired_time, message.chat.id)
+    async with bot.retrieve_data(message.from_user.id, message.chat.id) as data:
+        data["date_str"] = today_iso
+
+    text = (
+        "✏️ <b>Запрос на изменение расписания</b>\n\n"
+        + _calendar_day_text(today_iso, current_shift) + "\n\n"
+        "👇 <b>Выберите дату в календаре и нажмите время смены:</b>"
+    )
     await bot.send_message(
         message.chat.id,
-        "📅 Введите дату, на которую хотите изменить расписание (например: 25.10):\n\n"
-        "<i>Для отмены введите /cancel</i>",
-        parse_mode="HTML"
+        text,
+        parse_mode="HTML",
+        reply_markup=build_calendar_keyboard(
+            today.year, today.month, "req",
+            busy_dates=busy, selected_date=today_iso,
+            has_shift=(current_shift is not None),
+        ),
     )
-    await bot.set_state(message.from_user.id, RequestScheduleState.date_str, message.chat.id)
+
 
 @bot.message_handler(state=RequestScheduleState.date_str)
 async def process_req_date(message: telebot.types.Message):
@@ -662,35 +1233,14 @@ async def process_req_time(message: telebot.types.Message):
     user_id = message.from_user.id
 
     async with bot.retrieve_data(user_id, message.chat.id) as data:
-        date_str = data['date_str']
+        date_str = data.get('date_str')
 
     await bot.delete_state(user_id, message.chat.id)
-    user = await db.get_user(user_id)
-    if not user:
-        await bot.send_message(message.chat.id, NOT_REGISTERED_TEXT)
+    if not date_str:
+        await bot.send_message(message.chat.id, "⚠️ Ошибка сессии. Начните заново с выбора даты.")
         return
 
-    req_id = await db.create_request(user_id, date_str, desired_time)
-
-    # Руководство филиала, а если его нет — Администраторы
-    recipients = await db.get_request_recipients(user['branch'])
-    delivered = 0
-    for mgr in recipients:
-        try:
-            await bot.send_message(
-                mgr['telegram_id'],
-                f"📩 <b>Новый запрос на изменение расписания!</b>\n\n"
-                f"<b>Сотрудник:</b> {esc(user['full_name'])} ({esc(user['position'])})\n"
-                f"<b>Филиал:</b> {esc(user['branch'])}\n"
-                f"<b>Дата:</b> {esc(format_date(date_str))}\n"
-                f"<b>Желаемое время:</b> {esc(desired_time)}",
-                parse_mode="HTML",
-                reply_markup=get_request_keyboard(req_id)
-            )
-            delivered += 1
-        except Exception as e:
-            logger.error("Не удалось отправить заявку руководителю %s (%s)", uid_tag(mgr['telegram_id']), type(e).__name__)
-
+    req_id, delivered = await submit_schedule_request(user_id, date_str, desired_time)
     if delivered:
         await bot.send_message(message.chat.id, "✅ Ваш запрос успешно отправлен руководству!")
     else:
@@ -865,17 +1415,36 @@ async def select_emp_to_edit(call: telebot.types.CallbackQuery):
     if not manager or not target or not can_manage_branch(manager, target['branch']):
         await bot.answer_callback_query(call.id, NO_RIGHTS_TEXT, show_alert=True)
         return
-    # Сначала состояние, потом данные: без состояния хранилище не сохранит data
-    await bot.set_state(call.from_user.id, EditScheduleState.date_str, call.message.chat.id)
-    async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
-        data['target_user_id'] = target_id
 
     await bot.answer_callback_query(call.id)
+    today = shifts._today()
+    today_iso = today.isoformat()
+    busy = await db.get_user_shifts_for_month(target_id, today.year, today.month)
+    rows = await db.get_user_schedule(target_id, today_iso, today_iso)
+    current_shift = rows[0]["shift_time"] if rows else None
+
+    await bot.set_state(call.from_user.id, EditScheduleState.shift_time, call.message.chat.id)
+    async with bot.retrieve_data(call.from_user.id, call.message.chat.id) as data:
+        data['target_user_id'] = target_id
+        data['date_str'] = today_iso
+
+    text = (
+        f"🛠 <b>Редактирование расписания</b>\n\n"
+        + _calendar_day_text(today_iso, current_shift, employee_name=target['full_name']) + "\n\n"
+        "👇 <b>Выберите дату в календаре и нажмите время смены:</b>"
+    )
     await bot.send_message(
         call.message.chat.id,
-        "📅 Введите дату смены (например: 26.10):\n\n<i>Для отмены введите /cancel</i>",
-        parse_mode="HTML"
+        text,
+        parse_mode="HTML",
+        reply_markup=build_calendar_keyboard(
+            today.year, today.month, "edit",
+            target_id=target_id,
+            busy_dates=busy, selected_date=today_iso,
+            has_shift=(current_shift is not None),
+        ),
     )
+
 
 @bot.message_handler(state=EditScheduleState.date_str)
 async def process_edit_date(message: telebot.types.Message):
@@ -902,32 +1471,23 @@ async def process_edit_time(message: telebot.types.Message):
     user_id = message.from_user.id
 
     async with bot.retrieve_data(user_id, message.chat.id) as data:
-        target_id = data['target_user_id']
-        date_str = data['date_str']
+        target_id = data.get('target_user_id')
+        date_str = data.get('date_str')
 
     await bot.delete_state(user_id, message.chat.id)
-
-    # Права могли измениться, пока шёл ввод (роль сняли, сотрудника перевели)
-    manager = await get_user_with_role(user_id, MANAGEMENT_ROLES)
-    target = await db.get_user(target_id)
-    if not manager or not target or not can_manage_branch(manager, target['branch']):
-        await bot.send_message(message.chat.id, f"{NO_RIGHTS_TEXT} Смена не сохранена.")
+    if not target_id or not date_str:
+        await bot.send_message(message.chat.id, "⚠️ Ошибка сессии. Начните заново.")
         return
 
-    closed = await db.set_shift(target_id, date_str, shift_time)
-    text = "✅ Расписание сотрудника успешно обновлено!"
-    if closed:
-        text += f"\nОжидающие заявки сотрудника на эту дату закрыты: {closed}."
-    await bot.send_message(message.chat.id, text)
+    ok, name_or_err, closed = await apply_manager_shift(user_id, target_id, date_str, shift_time)
+    if not ok:
+        await bot.send_message(message.chat.id, f"{name_or_err} Смена не сохранена.")
+        return
 
-    # Личное уведомление сотруднику
-    try:
-        await bot.send_message(
-            target_id,
-            f"🔔 Ваше расписание на [{format_date(date_str)}] было изменено: новое время [{shift_time}]."
-        )
-    except Exception as e:
-        logger.error("Не удалось уведомить сотрудника %s о смене (%s)", uid_tag(target_id), type(e).__name__)
+    text = f"✅ Расписание сотрудника <b>{esc(name_or_err)}</b> успешно обновлено!\n📅 <b>Дата:</b> {format_date(date_str)}\n⏰ <b>Новое время:</b> <code>{esc(shift_time)}</code>"
+    if closed:
+        text += f"\n<i>Ожидающие заявки сотрудника на эту дату закрыты: {closed}.</i>"
+    await bot.send_message(message.chat.id, text, parse_mode="HTML")
 
 # =====================================================================
 # ХЭНДЛЕРЫ СУПЕРАДМИНИСТРАТОРА
