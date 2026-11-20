@@ -426,6 +426,16 @@ def test_file_state_storage_survives_restart(tmp_path):
     assert run(scenario()) == ("RequestScheduleState:date_str", {"date_str": "2026-10-25"})
 
 
+def test_file_state_storage_saves_state_name_not_object(tmp_path):
+    """Регрессия «🤔 Не понял»: файловое хранилище получало объект State, а фильтр сравнивает с именем."""
+    async def scenario():
+        s = B.FileStateStorage(tmp_path / "states.pkl")
+        await s.set_state(chat_id=1, user_id=1, state=B.RequestScheduleState.date_str)
+        return await s.get_state(chat_id=1, user_id=1)
+
+    assert run(scenario()) == B.RequestScheduleState.date_str.name
+
+
 def test_state_file_next_to_bot_and_ignored_by_git():
     import os
     root = Path(B.__file__).resolve().parent

@@ -2,15 +2,17 @@ import asyncio
 import hashlib
 import hmac
 import html
+import json
 import logging
 import os
 import pickle
 import re
 import secrets
 import sys
-from datetime import timedelta
+from datetime import date, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 
@@ -28,6 +30,7 @@ from telebot.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     KeyboardButton,
+    WebAppInfo,
 )
 
 import db
@@ -55,6 +58,12 @@ if _LOG_SALT_GENERATED:
     LOG_SALT = secrets.token_hex(16)
 
 logger = logging.getLogger(__name__)
+
+# Календарь (мини-приложение Telegram): страница по адресу https://… из .env.
+# Пусто или не https — кнопки календаря нет, бот работает как раньше.
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
+if WEBAPP_URL and not WEBAPP_URL.startswith("https://"):
+    WEBAPP_URL = ""
 
 # Состояния FSM — в файле рядом с базой, чтобы перезапуск не обрывал начатые сценарии
 STATE_FILE = Path(db.DB_FILE).parent / "bot_states.pkl"
@@ -107,6 +116,13 @@ class FileStateStorage(StatePickleStorage):
             pickle.dump(data, f)
         os.replace(tmp, self.file_path)
 
+    async def set_state(self, chat_id, user_id, state, *args, **kwargs):
+        # Как хранилище в памяти: пишем имя шага, а не объект State. Иначе фильтр state=…
+        # не узнаёт шаг, и на любой ответ бот пишет «🤔 Не понял» (баг 13.11, починка ученика).
+        if hasattr(state, "name"):
+            state = state.name
+        return await super().set_state(chat_id, user_id, state, *args, **kwargs)
+
 
 # Хранилище в памяти до запуска; main() подключает файловое (тесты работают без файла)
 bot = AsyncTeleBot(BOT_TOKEN, state_storage=StateMemoryStorage())
@@ -143,6 +159,7 @@ BTN_STAFF = "👥 Сотрудники"
 BTN_SET_ROLE = "👤 Назначить роль"
 BTN_BROADCAST = "📢 Глобальная рассылка"
 BTN_PAUSE = "⏸ Приостановить/Запустить бота"
+BTN_CALENDAR = "🗓 Календарь"
 MENU_TEXTS = {
     BTN_MY_SCHEDULE, BTN_REQUEST, BTN_PROFILE, BTN_BRANCH_SCHEDULE, BTN_REQUESTS,
     BTN_EDIT_SCHEDULE, BTN_STAFF, BTN_SET_ROLE, BTN_BROADCAST, BTN_PAUSE,
@@ -264,6 +281,80 @@ def schedule_period():
     return today.isoformat(), (today + timedelta(days=SCHEDULE_DAYS - 1)).isoformat()
 
 
+# ---------------------------------------------------------------------
+# Календарь (мини-приложение): смены уходят в ссылку, запрос приходит через sendData
+# ---------------------------------------------------------------------
+CALENDAR_DAYS_BACK = 31        # сколько прошлых дней показать точками
+CALENDAR_DAYS_AHEAD = 62       # и сколько будущих
+CALENDAR_MAX_SHIFTS = 100      # предохранитель длины ссылки
+CALENDAR_DATA_MAX = 512        # ответ календаря — короткий JSON
+CALENDAR_REQUEST_DAYS = 366    # запрос — не дальше года вперёд
+_CALENDAR_SHIFT_RE = re.compile(r"^(\d{2}):(\d{2}) - (\d{2}):(\d{2})$")
+
+
+def _calendar_shift_code(shift_time: str) -> str:
+    """«09:00 - 18:00» → «09001800», «Выходной» → «X», старый формат → «U»."""
+    if shift_time == shifts.DAY_OFF:
+        return "X"
+    m = _CALENDAR_SHIFT_RE.match(shift_time or "")
+    return "".join(m.groups()) if m else "U"
+
+
+def build_calendar_url(base: str, today: date, rows) -> str:
+    """Ссылка на календарь: t=сегодня, s=смены «ГГГГММДД:код» через запятую.
+    Только даты и время — без имён и ID."""
+    items = []
+    for r in rows:
+        try:
+            day = date.fromisoformat(r['date_str'])
+        except ValueError:
+            continue
+        items.append(f"{day:%Y%m%d}:{_calendar_shift_code(r['shift_time'])}")
+        if len(items) >= CALENDAR_MAX_SHIFTS:
+            break
+    query = urlencode({"t": f"{today:%Y%m%d}", "s": ",".join(items)}, safe=":,")
+    return f"{base}{'&' if '?' in base else '?'}{query}"
+
+
+async def calendar_url_for(user_id: int) -> str | None:
+    """Свежая ссылка на календарь пользователя; None, если календарь не настроен."""
+    if not WEBAPP_URL:
+        return None
+    today = shifts._today()
+    rows = await db.get_user_schedule(
+        user_id,
+        (today - timedelta(days=CALENDAR_DAYS_BACK)).isoformat(),
+        (today + timedelta(days=CALENDAR_DAYS_AHEAD)).isoformat(),
+    )
+    return build_calendar_url(WEBAPP_URL, today, rows)
+
+
+def parse_calendar_data(raw: str | None, today: date) -> tuple[str, str] | None:
+    """Ответ календаря {"a": "req", "d": "ГГГГ-ММ-ДД", "t": "09:00 - 18:00" | "Выходной"}
+    → (дата, время). Всё проверяем заново: страница могла прислать что угодно."""
+    if not raw or len(raw) > CALENDAR_DATA_MAX:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or data.get("a") != "req":
+        return None
+    day_text, time_text = data.get("d"), data.get("t")
+    if not isinstance(day_text, str) or not isinstance(time_text, str):
+        return None
+    try:
+        day = date.fromisoformat(day_text)
+    except ValueError:
+        return None
+    if not today <= day <= today + timedelta(days=CALENDAR_REQUEST_DAYS):
+        return None
+    desired_time = parse_shift(time_text)
+    if not desired_time:
+        return None
+    return day.isoformat(), desired_time
+
+
 async def mass_send(users, text: str, what: str) -> tuple[int, int]:
     """Отправка всем users с паузой между сообщениями. Возвращает (доставлено, не доставлено).
     В лог — только метка пользователя и тип ошибки, без текста сообщения."""
@@ -289,6 +380,10 @@ BAD_SHIFT_TEXT = (
     "<i>Для отмены введите /cancel</i>"
 )
 NOT_REGISTERED_TEXT = "⚠️ Вы еще не зарегистрированы в системе. Нажмите /start для регистрации."
+BAD_CALENDAR_TEXT = (
+    "❗️ Не получилось принять запрос из календаря. Откройте календарь заново "
+    f"или подайте запрос кнопкой «{BTN_REQUEST}»."
+)
 BAD_CALLBACK_TEXT = "Некорректные данные"
 NO_RIGHTS_TEXT = "⛔️ Недостаточно прав."
 OWN_REQUEST_TEXT = "⛔️ Нельзя решать собственную заявку."
@@ -297,8 +392,11 @@ NOT_ACTIVE_TARGET_TEXT = "⚠️ Сотрудник неактивен."
 # =====================================================================
 # КЛАВИАТУРЫ И ИНТЕРФЕЙС
 # =====================================================================
-def get_main_keyboard(role: str) -> ReplyKeyboardMarkup:
+def get_main_keyboard(role: str, calendar_url: str | None = None) -> ReplyKeyboardMarkup:
+    """calendar_url — ссылка на календарь со сменами пользователя (calendar_url_for); None — без кнопки."""
     markup = ReplyKeyboardMarkup(resize_keyboard=True)
+    if calendar_url:
+        markup.add(KeyboardButton(BTN_CALENDAR, web_app=WebAppInfo(calendar_url)))
     markup.add(KeyboardButton(BTN_MY_SCHEDULE))
     markup.add(KeyboardButton(BTN_REQUEST))
     markup.add(KeyboardButton(BTN_PROFILE))
@@ -573,7 +671,7 @@ async def cmd_start(message: telebot.types.Message):
             f"Филиал: {esc(user['branch'])}\n\n"
             f"Используйте кнопки меню ниже или команду /help для справки.",
             parse_mode="HTML",
-            reply_markup=get_main_keyboard(user['role'])
+            reply_markup=get_main_keyboard(user['role'], await calendar_url_for(user['telegram_id']))
         )
     else:
         logger.info("start: новый пользователь %s, регистрация", uid_tag(message.from_user.id))
@@ -748,15 +846,22 @@ async def view_my_schedule(message: telebot.types.Message):
     date_from, date_to = schedule_period()
     schedules = await db.get_user_schedule(message.from_user.id, date_from, date_to)
     period = f"{format_date(date_from)} — {format_date(date_to)}"
+    # Кнопка календаря со свежими сменами; без настройки календаря клавиатура не меняется
+    extra = {}
+    calendar_url = await calendar_url_for(message.from_user.id)
+    user = await db.get_user(message.from_user.id) if calendar_url else None
+    if user:
+        extra["reply_markup"] = get_main_keyboard(user['role'], calendar_url)
     if not schedules:
-        await bot.send_message(message.chat.id, f"У вас нет смен на ближайшие {SCHEDULE_DAYS} дней ({period}).")
+        await bot.send_message(message.chat.id, f"У вас нет смен на ближайшие {SCHEDULE_DAYS} дней ({period}).",
+                               **extra)
         return
 
     text = f"🗓 <b>Ваше расписание</b> ({period}):\n\n"
     for s in schedules:
         text += f"• <b>{esc(format_date(s['date_str']))}:</b> <code>{esc(s['shift_time'])}</code>\n"
 
-    await send_long(message.chat.id, text, parse_mode="HTML")
+    await send_long(message.chat.id, text, parse_mode="HTML", **extra)
 
 @bot.message_handler(func=lambda m: m.text == BTN_REQUEST)
 async def start_request_schedule(message: telebot.types.Message):
@@ -806,6 +911,28 @@ async def process_req_time(message: telebot.types.Message):
         await bot.send_message(message.chat.id, NOT_REGISTERED_TEXT)
         return
 
+    await submit_request(message.chat.id, user_id, user, date_str, desired_time)
+
+
+@bot.message_handler(content_types=['web_app_data'])
+async def process_calendar_request(message: telebot.types.Message):
+    """Запрос из календаря (мини-приложение, кнопка BTN_CALENDAR → sendData)."""
+    user_id = message.from_user.id
+    user = await db.get_user(user_id)
+    if not user:
+        await bot.send_message(message.chat.id, NOT_REGISTERED_TEXT)
+        return
+    parsed = parse_calendar_data(message.web_app_data.data if message.web_app_data else None, shifts._today())
+    if not parsed:
+        logger.warning("calendar: данные не приняты от %s", uid_tag(user_id))
+        await bot.send_message(message.chat.id, BAD_CALENDAR_TEXT)
+        return
+    await bot.delete_state(user_id, message.chat.id)
+    await submit_request(message.chat.id, user_id, user, *parsed)
+
+
+async def submit_request(chat_id, user_id: int, user, date_str: str, desired_time: str):
+    """Сохранить заявку и разослать руководству филиала (или Администраторам)."""
     req_id = await db.create_request(user_id, date_str, desired_time)
 
     # Руководство филиала, а если его нет — Администраторы
@@ -828,11 +955,11 @@ async def process_req_time(message: telebot.types.Message):
             logger.error("Не удалось отправить заявку руководителю %s (%s)", uid_tag(mgr['telegram_id']), type(e).__name__)
 
     if delivered:
-        await bot.send_message(message.chat.id, "✅ Ваш запрос успешно отправлен руководству!")
+        await bot.send_message(chat_id, "✅ Ваш запрос успешно отправлен руководству!")
     else:
         logger.warning("Заявка №%s сохранена, но не доставлена ни одному руководителю", req_id)
         await bot.send_message(
-            message.chat.id,
+            chat_id,
             f"⚠️ Запрос №{req_id} сохранён, но доставить его руководству сейчас не удалось "
             "(в филиале нет руководителя или он недоступен). Пожалуйста, сообщите руководителю лично."
         )
@@ -1526,6 +1653,8 @@ async def main():
     bot.add_custom_filter(asyncio_filters.StateFilter(bot))
     bot.add_custom_filter(asyncio_filters.IsDigitFilter())
 
+    if os.getenv("WEBAPP_URL", "").strip() and not WEBAPP_URL:
+        logger.warning("WEBAPP_URL должен начинаться с https:// — кнопка календаря выключена")
     logger.info("Бот успешно запущен и готов к работе!")
     await bot.polling(non_stop=True)
 
