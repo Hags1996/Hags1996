@@ -1,0 +1,393 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Календарь смен</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geologica:wght@500;600;700&family=Montserrat:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  /* Стиль сайта tap.delcappuccino.kz: тёплый белый, зелёный акцент, олива для выходных,
+     заголовки Geologica, текст Montserrat, скругления 16/22 и «таблетки». Просто, как App Store. */
+  :root {
+    --bg: #ffffff; --panel: #f5f5f3; --raised: #ecebe8; --text: #241c15; --hint: #5c5245; --line: #e5e3df;
+    --accent: #426349; --accent-dk: #31492f; --accent-soft: rgba(66,99,73,.14); --on-accent: #ffffff;
+    --olive: #849e29; --olive-soft: rgba(132,158,41,.16); --olive-text: #627122;
+    --weekend: #c2140f; --off: #849e29; --shadow: 0 6px 24px rgba(49,73,47,.22);
+    --r-md: 16px; --r-lg: 22px;
+    --font-display: "Geologica", system-ui, sans-serif;
+    --font-body: "Montserrat", system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  :root[data-theme="dark"] {
+    --bg: #12130f; --panel: #1c1d19; --raised: #262722; --text: #f3efe9; --hint: #b3aa9d; --line: #2e2f29;
+    --accent: #6f9a77; --accent-dk: #426349; --accent-soft: rgba(111,154,119,.2); --on-accent: #ffffff;
+    --olive: #a3bd48; --olive-soft: rgba(163,189,72,.18); --olive-text: #b8cf63;
+    --weekend: #ff6b63; --off: #a3bd48; --shadow: 0 6px 24px rgba(0,0,0,.6);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); color: var(--text);
+    font-family: var(--font-body); }
+  body { min-height: 100vh; overflow-x: hidden; user-select: none; max-width: 560px; margin: 0 auto; }
+  h1, h2, h3, .title b, .hero .big { font-family: var(--font-display); }
+
+  /* «Эта неделя» — с первого взгляда видно: сегодня работаешь или отдыхаешь */
+  .week { padding: 16px 16px 4px; }
+  .week-head { font-size: 13px; font-weight: 600; color: var(--hint); text-transform: uppercase; letter-spacing: .6px; margin: 0 2px 10px; }
+  .hero { border-radius: var(--r-lg); padding: 18px 18px 16px; background: var(--panel); color: var(--text); }
+  .hero.work { background: var(--accent); color: var(--on-accent); }
+  .hero.off { background: var(--olive-soft); }
+  .hero .label { font-size: 14px; font-weight: 500; opacity: .85; }
+  .hero .big { font-size: 28px; font-weight: 700; line-height: 1.15; margin-top: 4px; letter-spacing: -.3px; }
+  .hero .small { font-size: 14px; margin-top: 6px; opacity: .85; }
+  .strip { display: grid; grid-template-columns: repeat(7, 1fr); gap: 6px; margin-top: 10px; }
+  .tile { border-radius: var(--r-md); padding: 8px 0 9px; background: var(--panel); text-align: center;
+    display: flex; flex-direction: column; align-items: center; gap: 2px; min-height: 74px; transition: transform .12s; }
+  .tile:active { transform: scale(.95); }
+  .tile .wd { font-size: 11px; font-weight: 600; color: var(--hint); text-transform: uppercase; }
+  .tile .n { font-family: var(--font-display); font-size: 18px; font-weight: 600; }
+  .tile .st { font-size: 15px; line-height: 1; margin-top: 2px; }
+  .tile .tm { font-size: 10px; font-weight: 600; color: var(--hint); }
+  .tile.work { background: var(--accent-soft); }
+  .tile.work .tm { color: var(--accent); }
+  .tile.off { background: var(--olive-soft); }
+  .tile.off .tm { color: var(--olive-text); }
+  .tile.today { box-shadow: inset 0 0 0 2px var(--accent); }
+  .tile.selected { background: var(--accent); }
+  .tile.selected .wd, .tile.selected .n, .tile.selected .tm { color: var(--on-accent); }
+  .legend { display: flex; gap: 14px; justify-content: center; font-size: 12px; color: var(--hint); margin: 10px 0 2px; }
+  .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: 0; }
+  button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+
+  /* Шапка: «Ноябрь 2026», стрелки, кнопка «сегодня» с числом */
+  header { display: flex; align-items: center; padding: 14px 16px 6px; gap: 6px; }
+  .title { flex: 1; display: flex; align-items: baseline; gap: 8px; }
+  .title b { font-size: 24px; font-weight: 700; letter-spacing: -.3px; }
+  .title span { font-size: 16px; color: var(--hint); }
+  .icon { width: 40px; height: 40px; border-radius: 50%; display: grid; place-items: center; font-size: 22px; }
+  .icon:active { background: var(--panel); }
+  .today-btn { width: 30px; height: 30px; border: 2px solid var(--text); border-radius: 7px;
+    font-size: 13px; font-weight: 700; display: grid; place-items: center; margin: 0 6px; position: relative; }
+  .today-btn::before { content: ""; position: absolute; top: 4px; left: 3px; right: 3px; height: 2px; background: var(--text); }
+  .today-btn span { margin-top: 5px; }
+
+  /* Сетка месяца: 7 колонок, всегда 6 строк — не «прыгает» */
+  .weekdays, .grid { display: grid; grid-template-columns: repeat(7, 1fr); padding: 0 8px; }
+  .weekdays div { text-align: center; font-size: 12px; color: var(--hint); padding: 6px 0 8px; }
+  .weekdays div:nth-child(n+6) { color: var(--weekend); }
+  .grid { row-gap: 2px; touch-action: pan-y; transition: opacity .15s, transform .15s; }
+  .grid.swipe-l { opacity: 0; transform: translateX(-24px); }
+  .grid.swipe-r { opacity: 0; transform: translateX(24px); }
+  .day { height: 52px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start; padding-top: 4px; }
+  .num { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-size: 16px; font-weight: 500; }
+  .day.weekend .num { color: var(--weekend); }
+  .day.other .num { opacity: .3; }
+  .day.today .num { color: var(--accent); font-weight: 700; }
+  .day.selected .num { background: var(--accent); color: var(--on-accent); font-weight: 700; }
+  .day.selected.today .num { box-shadow: 0 0 0 3px var(--accent-soft); }
+  .dot { width: 5px; height: 5px; border-radius: 50%; margin-top: 3px; background: transparent; }
+  .day.has-shift .dot { background: var(--accent); }
+  .day.has-off .dot { background: var(--off); }
+  .day.other .dot { opacity: .35; }
+
+  /* Нижняя панель: события выбранного дня */
+  .agenda { margin-top: 10px; background: var(--panel); border-radius: var(--r-lg) var(--r-lg) 0 0; min-height: calc(100vh - 420px); padding: 18px 16px 110px; }
+  .agenda h2 { margin: 0; font-size: 17px; font-weight: 700; }
+  .agenda .sub { font-size: 13px; color: var(--hint); margin: 3px 0 14px; }
+  .card { display: flex; gap: 12px; align-items: stretch; background: var(--bg); border-radius: var(--r-md); padding: 14px; }
+  .bar { width: 4px; border-radius: 4px; background: var(--accent); }
+  .card.off .bar { background: var(--off); }
+  .card.off .what { color: var(--olive-text); }
+  .card .what { font-size: 16px; font-weight: 600; }
+  .card .when { font-size: 14px; color: var(--hint); margin-top: 3px; }
+  .empty { text-align: center; color: var(--hint); font-size: 14px; padding: 26px 0 8px; }
+  .empty .big { font-size: 34px; display: block; margin-bottom: 6px; }
+
+  /* Круглая кнопка «+» справа внизу, как в Android */
+  .fab { position: fixed; right: max(20px, calc(50vw - 260px)); bottom: 26px; width: 58px; height: 58px; border-radius: 50%;
+    background: var(--accent); color: var(--on-accent); font-size: 32px; font-weight: 300; line-height: 1;
+    display: grid; place-items: center; box-shadow: var(--shadow); transition: transform .15s; }
+  .fab:active { transform: scale(.92); }
+  .fab[hidden] { display: none; }
+
+  /* Нижний лист «Изменить смену» */
+  .veil { position: fixed; inset: 0; background: rgba(0,0,0,.35); opacity: 0; pointer-events: none; transition: opacity .2s; }
+  .sheet { position: fixed; left: 0; right: 0; bottom: 0; max-width: 560px; margin: 0 auto; background: var(--bg); border-radius: var(--r-lg) var(--r-lg) 0 0;
+    padding: 10px 18px 28px; transform: translateY(105%); transition: transform .25s cubic-bezier(.2,.8,.2,1); }
+  .open .veil { opacity: 1; pointer-events: auto; }
+  .open .sheet { transform: none; }
+  .grip { width: 38px; height: 4px; border-radius: 4px; background: var(--line); margin: 0 auto 14px; }
+  .sheet h3 { margin: 0 0 2px; font-size: 19px; }
+  .sheet .sub { color: var(--hint); font-size: 14px; margin-bottom: 16px; }
+  .seg { display: grid; grid-template-columns: 1fr 1fr; background: var(--panel); border-radius: 999px; padding: 4px; margin-bottom: 16px; }
+  .seg button { padding: 10px 0; border-radius: 999px; font-size: 15px; font-weight: 600; color: var(--hint); }
+  .seg button.on { background: var(--bg); color: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .times { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .times label { background: var(--panel); border-radius: 14px; padding: 10px 14px; font-size: 13px; color: var(--hint); }
+  .times input { display: block; width: 100%; border: 0; background: transparent; color: var(--text);
+    font-family: inherit; font-size: 22px; font-weight: 600; padding: 4px 0 0; outline: none; }
+  .times.hidden { display: none; }
+  .send { display: none; width: 100%; margin-top: 18px; height: 56px; border-radius: 999px;
+    background: var(--accent); color: var(--on-accent); font-size: 16px; font-weight: 600; }
+  .no-tg .send { display: block; }
+
+  .toast { position: fixed; left: 50%; bottom: 100px; transform: translateX(-50%); background: rgba(30,30,34,.92);
+    color: #fff; font-size: 14px; padding: 10px 16px; border-radius: 12px; opacity: 0; transition: opacity .2s;
+    pointer-events: none; max-width: 86vw; text-align: center; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<section class="week">
+  <div class="week-head">Эта неделя</div>
+  <div class="hero" id="hero"></div>
+  <div class="strip" id="strip"></div>
+  <div class="legend"><span><i style="background:var(--accent)"></i>Смена</span><span><i style="background:var(--olive)"></i>Выходной</span><span><i style="background:var(--line)"></i>Нет записи</span></div>
+</section>
+<header>
+  <div class="title"><b id="month"></b><span id="year"></span></div>
+  <button class="icon" id="prev" aria-label="Предыдущий месяц">‹</button>
+  <button class="icon" id="next" aria-label="Следующий месяц">›</button>
+  <button class="today-btn" id="today" aria-label="Сегодня"><span id="todayNum"></span></button>
+</header>
+<div class="weekdays"><div>Пн</div><div>Вт</div><div>Ср</div><div>Чт</div><div>Пт</div><div>Сб</div><div>Вс</div></div>
+<div class="grid" id="grid"></div>
+
+<section class="agenda">
+  <h2 id="dayTitle"></h2>
+  <div class="sub" id="daySub"></div>
+  <div id="events"></div>
+</section>
+
+<button class="fab" id="fab" aria-label="Изменить смену">+</button>
+
+<div id="sheetWrap">
+  <div class="veil" id="veil"></div>
+  <div class="sheet" role="dialog" aria-label="Изменить смену">
+    <div class="grip"></div>
+    <h3>Изменить смену</h3>
+    <div class="sub" id="sheetDate"></div>
+    <div class="seg"><button id="segShift" class="on">Смена</button><button id="segOff">Выходной</button></div>
+    <div class="times" id="times">
+      <label>Начало<input type="time" id="from" value="09:00" step="900"></label>
+      <label>Конец<input type="time" id="to" value="18:00" step="900"></label>
+    </div>
+    <button class="send" id="send">Отправить запрос</button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const inTelegram = !!(tg && tg.platform && tg.platform !== "unknown");
+  const $ = id => document.getElementById(id);
+
+  // Тема: как в Telegram у пользователя (светлая / тёмная)
+  const dark = inTelegram ? tg.colorScheme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  if (!inTelegram) document.body.classList.add("no-tg");
+  if (inTelegram) {
+    tg.ready(); tg.expand();
+    try { tg.setHeaderColor(dark ? "#12130f" : "#ffffff"); tg.setBackgroundColor(dark ? "#12130f" : "#ffffff"); } catch (e) {}
+  }
+
+  const MONTHS = ["Январь","Февраль","Март","Апрель","Май","Июнь","Июль","Август","Сентябрь","Октябрь","Ноябрь","Декабрь"];
+  const MONTHS_GEN = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+  const WEEKDAYS = ["Воскресенье","Понедельник","Вторник","Среда","Четверг","Пятница","Суббота"];
+
+  // Данные от бота: ?t=ГГГГММДД&s=ГГГГММДД:09001800,ГГГГММДД:X,…  (X — выходной, U — другая запись)
+  const qs = new URLSearchParams(location.search);
+  const parseYmd = s => /^\d{8}$/.test(s || "") ? new Date(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8)) : null;
+  const ymd = d => `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const today = parseYmd(qs.get("t")) || (() => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), n.getDate()); })();
+  const shifts = {};
+  (qs.get("s") || "").split(",").forEach(item => {
+    const [day, code] = item.split(":");
+    if (/^\d{8}$/.test(day || "") && code) shifts[day] = code;
+  });
+
+  let view = new Date(today.getFullYear(), today.getMonth(), 1);
+  let selected = new Date(today);
+  let dayOff = false;
+
+  const sameDay = (a, b) => ymd(a) === ymd(b);
+  const describe = code => {
+    if (code === "X") return { off: true, what: "Выходной 🌴", when: "Весь день" };
+    if (/^\d{8}$/.test(code)) {
+      const from = `${code.slice(0, 2)}:${code.slice(2, 4)}`, to = `${code.slice(4, 6)}:${code.slice(6, 8)}`;
+      let mins = (+code.slice(4, 6) * 60 + +code.slice(6, 8)) - (+code.slice(0, 2) * 60 + +code.slice(2, 4));
+      if (mins <= 0) mins += 24 * 60;                                   // ночная смена — через полночь
+      const h = Math.floor(mins / 60), m = mins % 60;
+      return { off: false, what: "Смена", when: `${from} – ${to} · ${h} ч${m ? " " + m + " мин" : ""}` };
+    }
+    return { off: false, what: "Смена", when: "Время — в чате, кнопка «Моё расписание»" };
+  };
+
+  function renderGrid() {
+    $("month").textContent = MONTHS[view.getMonth()];
+    $("year").textContent = view.getFullYear();
+    $("todayNum").textContent = today.getDate();
+    const grid = $("grid");
+    grid.innerHTML = "";
+    const shift = (view.getDay() + 6) % 7;                              // неделя с понедельника
+    const start = new Date(view.getFullYear(), view.getMonth(), 1 - shift);
+    for (let i = 0; i < 42; i++) {
+      const d = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+      const code = shifts[ymd(d)];
+      const cell = document.createElement("button");
+      cell.className = "day";
+      if (d.getMonth() !== view.getMonth()) cell.classList.add("other");
+      if (i % 7 >= 5) cell.classList.add("weekend");
+      if (sameDay(d, today)) cell.classList.add("today");
+      if (sameDay(d, selected)) cell.classList.add("selected");
+      if (code) cell.classList.add(code === "X" ? "has-off" : "has-shift");
+      cell.setAttribute("aria-label", `${d.getDate()} ${MONTHS_GEN[d.getMonth()]}${code ? ", есть смена" : ""}`);
+      cell.innerHTML = `<span class="num">${d.getDate()}</span><span class="dot"></span>`;
+      cell.addEventListener("click", () => pick(d));
+      grid.appendChild(cell);
+    }
+  }
+
+  function renderAgenda() {
+    const diff = Math.round((selected - today) / 86400000);
+    $("dayTitle").textContent = `${WEEKDAYS[selected.getDay()]}, ${selected.getDate()} ${MONTHS_GEN[selected.getMonth()]}`;
+    const days = n => n % 10 === 1 && n % 100 !== 11 ? "день" : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? "дня" : "дней";
+    $("daySub").textContent = diff === 0 ? "Сегодня" : diff === 1 ? "Завтра" : diff === -1 ? "Вчера"
+      : diff > 0 ? `Через ${diff} ${days(diff)}` : `${-diff} ${days(-diff)} назад`;
+    const code = shifts[ymd(selected)];
+    if (code) {
+      const e = describe(code);
+      $("events").innerHTML = `<div class="card${e.off ? " off" : ""}"><div class="bar"></div>
+        <div><div class="what">${e.what}</div><div class="when">${e.when}</div></div></div>`;
+    } else {
+      $("events").innerHTML = `<div class="empty"><span class="big">☕</span>Смен на этот день нет</div>`;
+    }
+    $("fab").hidden = diff < 0;                                         // прошедший день не меняем
+  }
+
+  // Неделя с понедельника: большая карточка «сегодня» и 7 плиток
+  const SHORT = ["Вс","Пн","Вт","Ср","Чт","Пт","Сб"];
+  const timeOf = code => /^\d{8}$/.test(code) ? `${code.slice(0, 2)}:${code.slice(2, 4)}–${code.slice(4, 6)}:${code.slice(6, 8)}` : "";
+  function renderWeek() {
+    const code = shifts[ymd(today)], hero = $("hero");
+    if (code === "X") {
+      hero.className = "hero off";
+      hero.innerHTML = `<div class="label">Сегодня</div><div class="big">Выходной 🌴</div><div class="small">Отдыхай!</div>`;
+    } else if (code) {
+      const e = describe(code);
+      hero.className = "hero work";
+      hero.innerHTML = `<div class="label">Сегодня</div><div class="big">Работаешь</div><div class="small">${e.when}</div>`;
+    } else {
+      hero.className = "hero";
+      hero.innerHTML = `<div class="label">Сегодня</div><div class="big">Смены нет</div><div class="small">Руководитель ещё не поставил смену</div>`;
+    }
+    const strip = $("strip");
+    strip.innerHTML = "";
+    const monday = new Date(today.getFullYear(), today.getMonth(), today.getDate() - (today.getDay() + 6) % 7);
+    for (let i = 0; i < 7; i++) {
+      const d = new Date(monday.getFullYear(), monday.getMonth(), monday.getDate() + i);
+      const c = shifts[ymd(d)];
+      const t = document.createElement("button");
+      t.className = "tile" + (c === "X" ? " off" : c ? " work" : "") + (sameDay(d, today) ? " today" : "")
+        + (sameDay(d, selected) ? " selected" : "");
+      t.setAttribute("aria-label", `${WEEKDAYS[d.getDay()]}, ${d.getDate()} ${MONTHS_GEN[d.getMonth()]}: ${c === "X" ? "выходной" : c ? "смена" : "нет записи"}`);
+      t.innerHTML = `<span class="wd">${SHORT[d.getDay()]}</span><span class="n">${d.getDate()}</span>`
+        + `<span class="st">${c === "X" ? "🌴" : c ? "💼" : "·"}</span><span class="tm">${c === "X" ? "отдых" : timeOf(c).split("–")[0]}</span>`;
+      t.addEventListener("click", () => pick(d));
+      strip.appendChild(t);
+    }
+  }
+
+  function render() { renderWeek(); renderGrid(); renderAgenda(); }
+
+  function pick(d) {
+    selected = d;
+    if (d.getMonth() !== view.getMonth()) view = new Date(d.getFullYear(), d.getMonth(), 1);
+    if (inTelegram && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
+    render();
+  }
+
+  function moveMonth(step) {
+    const grid = $("grid");
+    grid.classList.add(step > 0 ? "swipe-l" : "swipe-r");
+    setTimeout(() => {
+      view = new Date(view.getFullYear(), view.getMonth() + step, 1);
+      grid.classList.remove("swipe-l", "swipe-r");
+      renderGrid();
+    }, 140);
+  }
+
+  $("prev").onclick = () => moveMonth(-1);
+  $("next").onclick = () => moveMonth(1);
+  $("today").onclick = () => { view = new Date(today.getFullYear(), today.getMonth(), 1); pick(new Date(today)); };
+
+  // Свайп влево/вправо — соседний месяц, как на телефоне
+  let x0 = null, y0 = null;
+  $("grid").addEventListener("touchstart", e => { x0 = e.touches[0].clientX; y0 = e.touches[0].clientY; }, { passive: true });
+  $("grid").addEventListener("touchend", e => {
+    if (x0 === null) return;
+    const dx = e.changedTouches[0].clientX - x0, dy = e.changedTouches[0].clientY - y0;
+    if (Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy)) moveMonth(dx < 0 ? 1 : -1);
+    x0 = y0 = null;
+  }, { passive: true });
+
+  function toast(text) {
+    const t = $("toast");
+    t.textContent = text; t.classList.add("show");
+    clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("show"), 2600);
+  }
+
+  // Лист «Изменить смену»
+  function setDayOff(value) {
+    dayOff = value;
+    $("segShift").classList.toggle("on", !value);
+    $("segOff").classList.toggle("on", value);
+    $("times").classList.toggle("hidden", value);
+  }
+  function openSheet() {
+    $("sheetDate").textContent = `${WEEKDAYS[selected.getDay()]}, ${selected.getDate()} ${MONTHS_GEN[selected.getMonth()]} ${selected.getFullYear()}`;
+    const code = shifts[ymd(selected)];
+    if (code && /^\d{8}$/.test(code)) {
+      $("from").value = `${code.slice(0, 2)}:${code.slice(2, 4)}`;
+      $("to").value = `${code.slice(4, 6)}:${code.slice(6, 8)}`;
+    }
+    setDayOff(code === "X");
+    $("sheetWrap").classList.add("open");
+    if (inTelegram) {
+      tg.MainButton.setText("Отправить запрос"); tg.MainButton.show();
+      tg.BackButton.show();
+    }
+  }
+  function closeSheet() {
+    $("sheetWrap").classList.remove("open");
+    if (inTelegram) { tg.MainButton.hide(); tg.BackButton.hide(); }
+  }
+  function submit() {
+    const from = $("from").value, to = $("to").value;
+    if (!dayOff && (!from || !to || from === to)) { toast("Укажите начало и конец смены"); return; }
+    const payload = JSON.stringify({ a: "req", d: iso(selected), t: dayOff ? "Выходной" : `${from} - ${to}` });
+    if (inTelegram) {
+      tg.sendData(payload);                                             // календарь закроется, бот ответит в чате
+    } else {
+      toast("Откройте календарь из бота — отсюда запрос не отправить");
+    }
+  }
+
+  $("fab").onclick = openSheet;
+  $("veil").onclick = closeSheet;
+  $("segShift").onclick = () => setDayOff(false);
+  $("segOff").onclick = () => setDayOff(true);
+  $("send").onclick = submit;
+  if (inTelegram) {
+    tg.MainButton.onClick(submit);
+    tg.BackButton.onClick(closeSheet);
+  }
+
+  render();
+})();
+</script>
+</body>
+</html>
