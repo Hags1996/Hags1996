@@ -83,9 +83,14 @@
   .num { width: 36px; height: 36px; border-radius: 50%; display: grid; place-items: center; font-size: 16px; font-weight: 500; }
   .day.weekend .num { color: var(--weekend); }
   .day.other .num { opacity: .3; }
+  .day.other.selected .num { opacity: 1; }
   .day.today .num { color: var(--accent); font-weight: 700; }
   .day.selected .num { background: var(--accent); color: var(--on-accent); font-weight: 700; }
   .day.selected.today .num { box-shadow: 0 0 0 3px var(--accent-soft); }
+  /* Период «с — по»: концы — кружки, между ними мягкая полоса */
+  .day.in-range, .day.range-start, .day.range-end { background: linear-gradient(var(--accent-soft), var(--accent-soft)) no-repeat 0 4px / 100% 36px; }
+  .day.range-start { background-position: 100% 4px; background-size: 50% 36px; }
+  .day.range-end { background-size: 50% 36px; }
   .dot { width: 5px; height: 5px; border-radius: 50%; margin-top: 3px; background: transparent; }
   .day.has-shift .dot { background: var(--accent); }
   .day.has-off .dot { background: var(--off); }
@@ -103,6 +108,9 @@
   .card .when { font-size: 14px; color: var(--hint); margin-top: 3px; }
   .empty { text-align: center; color: var(--hint); font-size: 14px; padding: 26px 0 8px; }
   .empty .big { font-size: 34px; display: block; margin-bottom: 6px; }
+  .tip { text-align: center; color: var(--hint); font-size: 12px; margin-top: 12px; }
+  .reset { display: block; margin: 12px auto 0; padding: 10px 18px; border-radius: 999px; background: var(--raised);
+    font-size: 14px; font-weight: 600; }
 
   /* Круглая кнопка «+» справа внизу, как в Android */
   .fab { position: fixed; right: max(20px, calc(50vw - 260px)); bottom: 26px; width: 58px; height: 58px; border-radius: 50%;
@@ -136,6 +144,8 @@
     color: #fff; font-size: 14px; padding: 10px 16px; border-radius: 12px; opacity: 0; transition: opacity .2s;
     pointer-events: none; max-width: 86vw; text-align: center; }
   .toast.show { opacity: 1; }
+  .toast.ok { bottom: 50%; background: var(--accent); color: var(--on-accent); font-size: 16px; font-weight: 600;
+    padding: 14px 24px; border-radius: 999px; box-shadow: var(--shadow); white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -210,10 +220,21 @@
   });
 
   let view = new Date(today.getFullYear(), today.getMonth(), 1);
-  let selected = new Date(today);
+  const MAX_RANGE = 7;                                                  // дней в периоде, как CALENDAR_RANGE_MAX_DAYS у бота
+  let selected = new Date(today);                                       // выбранный день или начало периода
+  let rangeEnd = null;                                                  // конец периода включительно; null — выбран один день
+  let tapped = false;                                                   // день выбран нажатием: второе нажатие даст период
   let dayOff = false;
+  let sending = false;
 
   const sameDay = (a, b) => ymd(a) === ymd(b);
+  const dayDiff = (a, b) => Math.round((a - b) / 86400000);
+  const days = n => n % 10 === 1 && n % 100 !== 11 ? "день" : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? "дня" : "дней";
+  const inRange = d => rangeEnd ? d >= selected && d <= rangeEnd : sameDay(d, selected);
+  const rangeLen = () => rangeEnd ? dayDiff(rangeEnd, selected) + 1 : 1;
+  const rangeLabel = () => selected.getMonth() === rangeEnd.getMonth()       // «24–28 ноября» или «28 ноября – 2 декабря»
+    ? `${selected.getDate()}–${rangeEnd.getDate()} ${MONTHS_GEN[rangeEnd.getMonth()]}`
+    : `${selected.getDate()} ${MONTHS_GEN[selected.getMonth()]} – ${rangeEnd.getDate()} ${MONTHS_GEN[rangeEnd.getMonth()]}`;
   const describe = code => {
     if (code === "X") return { off: true, what: "Выходной 🌴", when: "Весь день" };
     if (/^\d{8}$/.test(code)) {
@@ -242,7 +263,8 @@
       if (d.getMonth() !== view.getMonth()) cell.classList.add("other");
       if (i % 7 >= 5) cell.classList.add("weekend");
       if (sameDay(d, today)) cell.classList.add("today");
-      if (sameDay(d, selected)) cell.classList.add("selected");
+      if (sameDay(d, selected) || (rangeEnd && sameDay(d, rangeEnd))) cell.classList.add("selected");
+      if (rangeEnd && inRange(d)) cell.classList.add(sameDay(d, selected) ? "range-start" : sameDay(d, rangeEnd) ? "range-end" : "in-range");
       if (code) cell.classList.add(code === "X" ? "has-off" : "has-shift");
       cell.setAttribute("aria-label", `${d.getDate()} ${MONTHS_GEN[d.getMonth()]}${code ? ", есть смена" : ""}`);
       cell.innerHTML = `<span class="num">${d.getDate()}</span><span class="dot"></span>`;
@@ -252,9 +274,19 @@
   }
 
   function renderAgenda() {
-    const diff = Math.round((selected - today) / 86400000);
+    if (rangeEnd) {                                                     // выбран период
+      const n = rangeLen();
+      $("dayTitle").textContent = `${rangeLabel()} · ${n} ${days(n)}`;
+      $("daySub").textContent = "Одно время или выходной на весь период";
+      $("events").innerHTML = `<div class="card"><div class="bar"></div>
+        <div><div class="what">Период выбран</div><div class="when">Нажмите «+» — запрос сразу на все дни</div></div></div>
+        <button class="reset" id="resetRange">Сбросить период</button>`;
+      $("resetRange").onclick = () => select(selected);
+      $("fab").hidden = false;
+      return;
+    }
+    const diff = dayDiff(selected, today);
     $("dayTitle").textContent = `${WEEKDAYS[selected.getDay()]}, ${selected.getDate()} ${MONTHS_GEN[selected.getMonth()]}`;
-    const days = n => n % 10 === 1 && n % 100 !== 11 ? "день" : [2, 3, 4].includes(n % 10) && ![12, 13, 14].includes(n % 100) ? "дня" : "дней";
     $("daySub").textContent = diff === 0 ? "Сегодня" : diff === 1 ? "Завтра" : diff === -1 ? "Вчера"
       : diff > 0 ? `Через ${diff} ${days(diff)}` : `${-diff} ${days(-diff)} назад`;
     const code = shifts[ymd(selected)];
@@ -265,6 +297,8 @@
     } else {
       $("events").innerHTML = `<div class="empty"><span class="big">☕</span>Смен на этот день нет</div>`;
     }
+    if (diff >= 0) $("events").insertAdjacentHTML("beforeend",
+      `<div class="tip">Нужно несколько дней? Нажмите второй день — выберется период до ${MAX_RANGE} дней</div>`);
     $("fab").hidden = diff < 0;                                         // прошедший день не меняем
   }
 
@@ -292,7 +326,7 @@
       const c = shifts[ymd(d)];
       const t = document.createElement("button");
       t.className = "tile" + (c === "X" ? " off" : c ? " work" : "") + (sameDay(d, today) ? " today" : "")
-        + (sameDay(d, selected) ? " selected" : "");
+        + (inRange(d) ? " selected" : "");
       t.setAttribute("aria-label", `${WEEKDAYS[d.getDay()]}, ${d.getDate()} ${MONTHS_GEN[d.getMonth()]}: ${c === "X" ? "выходной" : c ? "смена" : "нет записи"}`);
       t.innerHTML = `<span class="wd">${SHORT[d.getDay()]}</span><span class="n">${d.getDate()}</span>`
         + `<span class="st">${c === "X" ? "🌴" : c ? "💼" : "·"}</span><span class="tm">${c === "X" ? "отдых" : timeOf(c).split("–")[0]}</span>`;
@@ -303,9 +337,19 @@
 
   function render() { renderWeek(); renderGrid(); renderAgenda(); }
 
+  // Один день без периода; следующее нажатие начнёт выбор заново (кнопки «сегодня» и «Сбросить период»)
+  function select(d) { selected = d; rangeEnd = null; tapped = false; render(); }
+
+  // Первое нажатие — день А, второе — день Б: период А…Б в любом порядке. Третье — выбор заново.
   function pick(d) {
-    selected = d;
-    if (d.getMonth() !== view.getMonth()) view = new Date(d.getFullYear(), d.getMonth(), 1);
+    const second = tapped && !rangeEnd && !sameDay(d, selected) && selected >= today && d >= today;
+    if (second && Math.abs(dayDiff(d, selected)) < MAX_RANGE) {
+      if (d < selected) { rangeEnd = selected; selected = d; } else rangeEnd = d;
+    } else {                                                            // месяц не листаем, когда период готов: оба конца на виду
+      if (second) toast(`Период — не больше ${MAX_RANGE} дней подряд. Выбран один день`);
+      selected = d; rangeEnd = null; tapped = true;
+      if (d.getMonth() !== view.getMonth()) view = new Date(d.getFullYear(), d.getMonth(), 1);
+    }
     if (inTelegram && tg.HapticFeedback) tg.HapticFeedback.selectionChanged();
     render();
   }
@@ -322,7 +366,7 @@
 
   $("prev").onclick = () => moveMonth(-1);
   $("next").onclick = () => moveMonth(1);
-  $("today").onclick = () => { view = new Date(today.getFullYear(), today.getMonth(), 1); pick(new Date(today)); };
+  $("today").onclick = () => { view = new Date(today.getFullYear(), today.getMonth(), 1); select(new Date(today)); };
 
   // Свайп влево/вправо — соседний месяц, как на телефоне
   let x0 = null, y0 = null;
@@ -334,9 +378,9 @@
     x0 = y0 = null;
   }, { passive: true });
 
-  function toast(text) {
+  function toast(text, ok) {
     const t = $("toast");
-    t.textContent = text; t.classList.add("show");
+    t.textContent = text; t.classList.toggle("ok", !!ok); t.classList.add("show");
     clearTimeout(toast.timer); toast.timer = setTimeout(() => t.classList.remove("show"), 2600);
   }
 
@@ -348,7 +392,8 @@
     $("times").classList.toggle("hidden", value);
   }
   function openSheet() {
-    $("sheetDate").textContent = `${WEEKDAYS[selected.getDay()]}, ${selected.getDate()} ${MONTHS_GEN[selected.getMonth()]} ${selected.getFullYear()}`;
+    $("sheetDate").textContent = rangeEnd ? `${rangeLabel()} · ${rangeLen()} ${days(rangeLen())}`
+      : `${WEEKDAYS[selected.getDay()]}, ${selected.getDate()} ${MONTHS_GEN[selected.getMonth()]} ${selected.getFullYear()}`;
     const code = shifts[ymd(selected)];
     if (code && /^\d{8}$/.test(code)) {
       $("from").value = `${code.slice(0, 2)}:${code.slice(2, 4)}`;
@@ -366,14 +411,18 @@
     if (inTelegram) { tg.MainButton.hide(); tg.BackButton.hide(); }
   }
   function submit() {
+    if (sending) return;
     const from = $("from").value, to = $("to").value;
     if (!dayOff && (!from || !to || from === to)) { toast("Укажите начало и конец смены"); return; }
-    const payload = JSON.stringify({ a: "req", d: iso(selected), t: dayOff ? "Выходной" : `${from} - ${to}` });
-    if (inTelegram) {
-      tg.sendData(payload);                                             // календарь закроется, бот ответит в чате
-    } else {
-      toast("Откройте календарь из бота — отсюда запрос не отправить");
-    }
+    const data = { a: "req", d: iso(selected) };
+    if (rangeEnd) data.e = iso(rangeEnd);                               // период; без «e» — один день
+    data.t = dayOff ? "Выходной" : `${from} - ${to}`;
+    const payload = JSON.stringify(data);
+    if (!inTelegram) { toast("Откройте календарь из бота — отсюда запрос не отправить"); return; }
+    sending = true;                                                     // второе нажатие не отправит запрос дважды
+    try { tg.MainButton.disable(); if (tg.HapticFeedback) tg.HapticFeedback.notificationOccurred("success"); } catch (e) {}
+    toast("Запрос отправлен ✓", true);
+    setTimeout(() => tg.sendData(payload), 700);                        // календарь закроется, бот ответит в чате
   }
 
   $("fab").onclick = openSheet;

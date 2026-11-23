@@ -1,6 +1,6 @@
 """Календарь (мини-приложение): ссылка со сменами, разбор ответа, запрос из календаря."""
 import json
-from datetime import date
+from datetime import date, timedelta
 
 import bot as B
 import db
@@ -44,13 +44,16 @@ def test_url_length_is_capped():
 
 # --- разбор ответа календаря ---
 
-def req(d, t, a="req"):
-    return json.dumps({"a": a, "d": d, "t": t})
+def req(d, t, a="req", e=None):
+    data = {"a": a, "d": d, "t": t}
+    if e is not None:
+        data["e"] = e                                     # конец периода включительно
+    return json.dumps(data)
 
 
 def test_parse_ok_and_normalized():
-    assert B.parse_calendar_data(req("2026-11-18", "9:00-18:00"), TODAY) == ("2026-11-18", "09:00 - 18:00")
-    assert B.parse_calendar_data(req("2026-11-17", "выходной"), TODAY) == ("2026-11-17", "Выходной")
+    assert B.parse_calendar_data(req("2026-11-18", "9:00-18:00"), TODAY) == (["2026-11-18"], "09:00 - 18:00")
+    assert B.parse_calendar_data(req("2026-11-17", "выходной"), TODAY) == (["2026-11-17"], "Выходной")
 
 
 def test_parse_rejects_bad_input():
@@ -63,6 +66,49 @@ def test_parse_rejects_bad_input():
            req("2026-11-18", "09:00 - 18:00") + " " * B.CALENDAR_DATA_MAX]
     for raw in bad:
         assert B.parse_calendar_data(raw, TODAY) is None, raw
+
+
+# --- разбор периода «с — по» ---
+
+def test_parse_period_ok():
+    assert B.parse_calendar_data(req("2026-11-24", "9:00-18:00", e="2026-11-26"), TODAY) == \
+        (["2026-11-24", "2026-11-25", "2026-11-26"], "09:00 - 18:00")
+    # через границу месяца, ровно CALENDAR_RANGE_MAX_DAYS дней, начиная с сегодня
+    days, shift = B.parse_calendar_data(req("2026-11-28", "Выходной", e="2026-12-04"), TODAY)
+    assert (days[0], days[-1], len(days), shift) == ("2026-11-28", "2026-12-04", B.CALENDAR_RANGE_MAX_DAYS, "Выходной")
+    assert B.parse_calendar_data(req("2026-11-17", "10:00 - 19:00", e="2026-11-18"), TODAY) == \
+        (["2026-11-17", "2026-11-18"], "10:00 - 19:00")
+
+
+def test_parse_period_of_one_day_and_without_end_are_same():
+    one = (["2026-11-18"], "09:00 - 18:00")
+    assert B.parse_calendar_data(req("2026-11-18", "09:00 - 18:00"), TODAY) == one
+    assert B.parse_calendar_data(req("2026-11-18", "09:00 - 18:00", e="2026-11-18"), TODAY) == one
+
+
+def test_parse_period_rejects_bad_input():
+    far = TODAY + timedelta(days=B.CALENDAR_REQUEST_DAYS)
+    bad = [req("2026-11-24", "09:00 - 18:00", e="2026-11-23"),      # конец раньше начала
+           req("2026-11-24", "09:00 - 18:00", e="2026-12-01"),      # 8 дней — длиннее лимита
+           req("2026-11-24", "09:00 - 18:00", e="2027-11-24"),      # год
+           req("2026-11-16", "09:00 - 18:00", e="2026-11-18"),      # начало в прошлом
+           req("2026-11-10", "09:00 - 18:00", e="2026-11-12"),      # весь период в прошлом
+           req(far.isoformat(), "09:00 - 18:00", e=(far + timedelta(days=1)).isoformat()),  # конец дальше года
+           req("2026-11-24", "09:00 - 18:00", e="завтра"),          # мусор
+           req("2026-11-24", "09:00 - 18:00", e=""),
+           req("2026-11-24", "09:00 - 18:00", e="2026-02-30"),      # нет такой даты
+           req("2026-11-24", "09:00 - 18:00", e=20261126),          # не строка
+           req("2026-11-24", "09:00 - 18:00", e=["2026-11-26"]),
+           json.dumps({"a": "req", "d": "2026-11-24", "e": None, "t": "09:00 - 18:00"}),
+           req("2026-11-24", "25:00 - 18:00", e="2026-11-26")]      # нет такого времени
+    for raw in bad:
+        assert B.parse_calendar_data(raw, TODAY) is None, raw
+
+
+def test_period_answer_fits_data_limit():
+    longest = json.dumps({"a": "req", "d": "2026-11-24", "e": "2026-11-30", "t": "09:00 - 18:00"})
+    assert len(longest) < B.CALENDAR_DATA_MAX
+    assert B.parse_calendar_data(longest, TODAY) is not None
 
 
 # --- кнопка в меню ---
@@ -115,3 +161,52 @@ def test_calendar_needs_registration_and_access(tg):
     replies = calendar_message(tg, 222, req(FIXED_TODAY.isoformat(), "10:00 - 19:00"))
     assert any("на рассмотрении" in t for t in tg.texts_to(replies, 222))
     assert run(db.get_pending_requests("Абая")) == []
+
+
+def test_calendar_period_makes_request_per_day_and_one_answer(tg, monkeypatch):
+    monkeypatch.setattr(B, "BROADCAST_DELAY", 0)
+    register(tg, 222)
+    days = [(FIXED_TODAY + timedelta(days=i)).isoformat() for i in (1, 2, 3)]
+    replies = calendar_message(tg, 222, req(days[0], "10:00 - 19:00", e=days[-1]))
+
+    to_worker = tg.texts_to(replies, 222)                 # сотруднику — одно итоговое сообщение
+    assert len(to_worker) == 1
+    assert "на период" in to_worker[0] and "3 дня" in to_worker[0] and "10:00 - 19:00" in to_worker[0]
+    assert "05.10.2026" in to_worker[0] and "07.10.2026" in to_worker[0]
+
+    to_admin = [r for r in replies if r["chat_id"] == str(ADMIN_ID) and r["method"] == "sendMessage"]
+    assert len(to_admin) == 3                             # руководству — обычная заявка на каждый день
+    assert all("Новый запрос на изменение расписания" in r["text"] and "app_req:" in (r["reply_markup"] or "")
+               for r in to_admin)
+    pending = run(db.get_pending_requests("Абая"))
+    assert sorted((p["date_str"], p["desired_time"]) for p in pending) == [(d, "10:00 - 19:00") for d in days]
+
+
+def test_calendar_period_request_is_decided_per_day(tg, monkeypatch):
+    monkeypatch.setattr(B, "BROADCAST_DELAY", 0)
+    register(tg, 222)
+    days = [(FIXED_TODAY + timedelta(days=i)).isoformat() for i in (1, 2)]
+    calendar_message(tg, 222, req(days[0], "Выходной", e=days[1]))
+    first = min(p["id"] for p in run(db.get_pending_requests("Абая")))
+    tg.press(ADMIN_ID, f"app_req:{first}")            # обычная кнопка обычной заявки
+    assert [p["date_str"] for p in run(db.get_pending_requests("Абая"))] == [days[1]]
+
+
+def test_calendar_bad_period_creates_nothing(tg):
+    register(tg, 222)
+    start = (FIXED_TODAY + timedelta(days=1)).isoformat()
+    for end in ((FIXED_TODAY + timedelta(days=1 + B.CALENDAR_RANGE_MAX_DAYS)).isoformat(),   # длиннее лимита
+                FIXED_TODAY.isoformat(),                                                      # конец раньше начала
+                "мусор"):
+        replies = calendar_message(tg, 222, req(start, "10:00 - 19:00", e=end))
+        assert tg.texts_to(replies, 222) == [B.BAD_CALENDAR_TEXT], end
+        assert tg.texts_to(replies, ADMIN_ID) == []
+    assert run(db.get_pending_requests("Абая")) == []
+
+
+def test_calendar_period_without_management_gets_one_honest_answer(tg, monkeypatch):
+    monkeypatch.setattr(B, "BROADCAST_DELAY", 0)
+    days = [(FIXED_TODAY + timedelta(days=i)).isoformat() for i in (1, 2)]
+    replies = calendar_message(tg, ADMIN_ID, req(days[0], "10:00 - 19:00", e=days[1]))   # свою заявку не получает
+    to_self = tg.texts_to(replies, ADMIN_ID)
+    assert len(to_self) == 1 and "доставить руководству сейчас не удалось 2 из 2" in to_self[0]

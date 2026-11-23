@@ -289,6 +289,7 @@ CALENDAR_DAYS_AHEAD = 62       # и сколько будущих
 CALENDAR_MAX_SHIFTS = 100      # предохранитель длины ссылки
 CALENDAR_DATA_MAX = 512        # ответ календаря — короткий JSON
 CALENDAR_REQUEST_DAYS = 366    # запрос — не дальше года вперёд
+CALENDAR_RANGE_MAX_DAYS = 7    # запрос на период «с — по» — не больше недели подряд
 _CALENDAR_SHIFT_RE = re.compile(r"^(\d{2}):(\d{2}) - (\d{2}):(\d{2})$")
 
 
@@ -329,9 +330,10 @@ async def calendar_url_for(user_id: int) -> str | None:
     return build_calendar_url(WEBAPP_URL, today, rows)
 
 
-def parse_calendar_data(raw: str | None, today: date) -> tuple[str, str] | None:
+def parse_calendar_data(raw: str | None, today: date) -> tuple[list[str], str] | None:
     """Ответ календаря {"a": "req", "d": "ГГГГ-ММ-ДД", "t": "09:00 - 18:00" | "Выходной"}
-    → (дата, время). Всё проверяем заново: страница могла прислать что угодно."""
+    → ([дата], время). С необязательным "e": "ГГГГ-ММ-ДД" (конец периода включительно) —
+    все дни периода по порядку. Всё проверяем заново: страница могла прислать что угодно."""
     if not raw or len(raw) > CALENDAR_DATA_MAX:
         return None
     try:
@@ -347,12 +349,23 @@ def parse_calendar_data(raw: str | None, today: date) -> tuple[str, str] | None:
         day = date.fromisoformat(day_text)
     except ValueError:
         return None
-    if not today <= day <= today + timedelta(days=CALENDAR_REQUEST_DAYS):
+    last = day
+    if "e" in data:
+        if not isinstance(data["e"], str):
+            return None
+        try:
+            last = date.fromisoformat(data["e"])
+        except ValueError:
+            return None
+    length = (last - day).days + 1
+    if not 1 <= length <= CALENDAR_RANGE_MAX_DAYS:
+        return None
+    if not today <= day or not last <= today + timedelta(days=CALENDAR_REQUEST_DAYS):
         return None
     desired_time = parse_shift(time_text)
     if not desired_time:
         return None
-    return day.isoformat(), desired_time
+    return [(day + timedelta(days=i)).isoformat() for i in range(length)], desired_time
 
 
 async def mass_send(users, text: str, what: str) -> tuple[int, int]:
@@ -928,11 +941,49 @@ async def process_calendar_request(message: telebot.types.Message):
         await bot.send_message(message.chat.id, BAD_CALENDAR_TEXT)
         return
     await bot.delete_state(user_id, message.chat.id)
-    await submit_request(message.chat.id, user_id, user, *parsed)
+    days, desired_time = parsed
+    if len(days) == 1:
+        await submit_request(message.chat.id, user_id, user, days[0], desired_time)
+    else:
+        await submit_period_request(message.chat.id, user_id, user, days, desired_time)
 
 
-async def submit_request(chat_id, user_id: int, user, date_str: str, desired_time: str):
-    """Сохранить заявку и разослать руководству филиала (или Администраторам)."""
+def _days_word(n: int) -> str:
+    """1 день, 2 дня, 5 дней."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "день"
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "дня"
+    return "дней"
+
+
+async def submit_period_request(chat_id, user_id: int, user, days: list[str], desired_time: str):
+    """Запрос на период: обычная заявка на каждый день, сотруднику — одно итоговое сообщение."""
+    lost = 0
+    for i, date_str in enumerate(days):
+        if i:
+            await asyncio.sleep(BROADCAST_DELAY)
+        if not await submit_request(chat_id, user_id, user, date_str, desired_time, confirm=False):
+            lost += 1
+    period = (f"<b>{esc(format_date(days[0]))} – {esc(format_date(days[-1]))}</b> "
+              f"({len(days)} {_days_word(len(days))}, <code>{esc(desired_time)}</code>)")
+    if not lost:
+        await bot.send_message(chat_id, f"✅ Ваш запрос на период {period} успешно отправлен руководству!",
+                               parse_mode="HTML")
+    else:
+        await bot.send_message(
+            chat_id,
+            f"⚠️ Запрос на период {period} сохранён, но доставить руководству сейчас не удалось "
+            f"{lost} из {len(days)} заявок (в филиале нет руководителя или он недоступен). "
+            "Пожалуйста, сообщите руководителю лично.",
+            parse_mode="HTML"
+        )
+
+
+async def submit_request(chat_id, user_id: int, user, date_str: str, desired_time: str, confirm: bool = True) -> int:
+    """Сохранить заявку и разослать руководству филиала (или Администраторам).
+    confirm=False — не отвечать сотруднику (итог по периоду пришлёт submit_period_request).
+    Возвращает, скольким руководителям заявка доставлена."""
     req_id = await db.create_request(user_id, date_str, desired_time)
 
     # Руководство филиала, а если его нет — Администраторы
@@ -954,15 +1005,19 @@ async def submit_request(chat_id, user_id: int, user, date_str: str, desired_tim
         except Exception as e:
             logger.error("Не удалось отправить заявку руководителю %s (%s)", uid_tag(mgr['telegram_id']), type(e).__name__)
 
+    if not delivered:
+        logger.warning("Заявка №%s сохранена, но не доставлена ни одному руководителю", req_id)
+    if not confirm:
+        return delivered
     if delivered:
         await bot.send_message(chat_id, "✅ Ваш запрос успешно отправлен руководству!")
     else:
-        logger.warning("Заявка №%s сохранена, но не доставлена ни одному руководителю", req_id)
         await bot.send_message(
             chat_id,
             f"⚠️ Запрос №{req_id} сохранён, но доставить его руководству сейчас не удалось "
             "(в филиале нет руководителя или он недоступен). Пожалуйста, сообщите руководителю лично."
         )
+    return delivered
 
 # =====================================================================
 # ХЭНДЛЕРЫ МЕНЕДЖЕРА И УПРАВЛЯЮЩЕГО
