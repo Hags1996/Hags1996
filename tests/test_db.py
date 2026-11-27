@@ -200,7 +200,7 @@ def test_migration_2_adds_status_with_backup(tmp_path, monkeypatch):
     con.close()
 
     con = sqlite3.connect(path)
-    assert con.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert con.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     assert con.execute("SELECT telegram_id, branch, status FROM users ORDER BY telegram_id").fetchall() == \
         [(5, "Абая", "active"), (111, "Гугл", "active")]  # «Гугл» в базе не трогаем
     assert con.execute("SELECT date_str FROM schedules").fetchall() == [("2026-10-01",)]

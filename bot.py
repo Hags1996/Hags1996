@@ -9,7 +9,8 @@ import pickle
 import re
 import secrets
 import sys
-from datetime import date, timedelta
+import time
+from datetime import date, datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import urlencode
@@ -34,6 +35,7 @@ from telebot.types import (
 )
 
 import db
+import qr
 import shifts
 from shifts import parse_date, parse_shift, format_date
 from db import ROLE_WORKER, ROLE_MANAGER, ROLE_BRANCH_ADMIN, ROLE_SUPERADMIN, MANAGEMENT_ROLES
@@ -64,6 +66,9 @@ logger = logging.getLogger(__name__)
 WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip()
 if WEBAPP_URL and not WEBAPP_URL.startswith("https://"):
     WEBAPP_URL = ""
+
+# Секрет QR-отметки прихода (любая длинная случайная строка). Пусто — отметка не настроена.
+QR_SECRET_KEY = os.getenv("QR_SECRET_KEY", "").strip()
 
 # Состояния FSM — в файле рядом с базой, чтобы перезапуск не обрывал начатые сценарии
 STATE_FILE = Path(db.DB_FILE).parent / "bot_states.pkl"
@@ -142,6 +147,8 @@ STATUS_NAMES = {
 }
 
 BRANCHES = ["Гагарина", "Абая"]
+# Коды филиалов для QR-ссылки (латиница, a-z0-9): параметр /start не принимает кириллицу
+BRANCH_CODES = {"Гагарина": "gagarina", "Абая": "abaya"}
 
 SCHEDULE_DAYS = 14          # сколько дней расписания показывать
 MAX_MESSAGE_LEN = 4096      # лимит Telegram на длину сообщения
@@ -629,6 +636,8 @@ async def cmd_help(message: telebot.types.Message):
             f"• <b>{BTN_REQUESTS}</b> — одобрение или отклонение заявок работников\n"
             f"• <b>{BTN_EDIT_SCHEDULE}</b> — прямое назначение/редактирование смены\n"
             f"• <b>{BTN_STAFF}</b> — карточки сотрудников: сделать неактивным, вернуть в работу\n"
+            f"• /qr — ссылка для отметки прихода своего филиала (Администратору — всех), "
+            f"действует около {QR_VALID_SECONDS} секунд\n"
         )
 
     if role == ROLE_SUPERADMIN:
@@ -666,13 +675,26 @@ async def cmd_profile(message: telebot.types.Message):
 # =====================================================================
 # ХЭНДЛЕРЫ: СТАРТ И РЕГИСТРАЦИЯ
 # =====================================================================
+def start_payload(text) -> str:
+    """Параметр после /start (из ссылки t.me/<бот>?start=…), пустая строка — без параметра."""
+    parts = (text or "").split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
 @bot.message_handler(commands=['start'])
 async def cmd_start(message: telebot.types.Message):
+    payload = start_payload(message.text)
+    is_checkin = payload.startswith(qr.START_PREFIX)
     user = await db.get_user(message.from_user.id)
+    if is_checkin and user and user['status'] == USER_ACTIVE:
+        await qr_checkin(message, user, payload)
+        return
+    # QR отсканировал тот, у кого ещё нет доступа: обычный /start, без отметки
+    scan_again = f"\n\n{QR_SCAN_AGAIN_TEXT}" if is_checkin else ""
     if user and user['status'] == USER_PENDING:
         await bot.send_message(
             message.chat.id,
-            f"{PENDING_TEXT}\nКогда Администратор подтвердит доступ, бот пришлёт сообщение.",
+            f"{PENDING_TEXT}\nКогда Администратор подтвердит доступ, бот пришлёт сообщение.{scan_again}",
             reply_markup=ReplyKeyboardRemove()
         )
     elif user:
@@ -692,7 +714,7 @@ async def cmd_start(message: telebot.types.Message):
             message.chat.id,
             "Добро пожаловать! Давайте пройдем регистрацию.\n\n"
             "Введите ваше ФИО (например: Иванов Иван):\n\n"
-            "<i>Для отмены введите /cancel</i>",
+            f"<i>Для отмены введите /cancel</i>{scan_again}",
             parse_mode="HTML"
         )
         await bot.set_state(message.from_user.id, RegistrationState.full_name, message.chat.id)
@@ -850,6 +872,127 @@ async def process_registration_decision(call: telebot.types.CallbackQuery):
         await bot.send_message(target_id, user_text, reply_markup=user_markup)
     except Exception as e:
         logger.error("Не удалось сообщить решение по доступу пользователю %s (%s)", uid_tag(target_id), type(e).__name__)
+
+# =====================================================================
+# ОТМЕТКА ПРИХОДА ПО QR (шаг 1: проверка кода в боте и /qr)
+# Сотрудник сканирует QR → Telegram открывает бота с /start chk_<филиал>_<код>.
+# Время — из сообщения Telegram (message.date), а не из часов бота: бот мог спать.
+# =====================================================================
+# Код окна t принимается в окнах t−1…t+1: после показа он живёт от 1 до 2 окон (15–30 с)
+QR_VALID_SECONDS = 2 * qr.QR_WINDOW_SECONDS
+QR_NOT_SET_TEXT = "⚠️ Отметка не настроена. Сообщите руководителю."
+QR_BAD_CODE_TEXT = "❗️ Код не распознан. Отсканируйте QR на точке ещё раз."
+QR_EXPIRED_TEXT = "⏰ Код устарел, отсканируйте QR ещё раз."
+QR_SCAN_AGAIN_TEXT = "📷 После подтверждения доступа отсканируйте QR ещё раз — тогда приход отметится."
+
+_bot_username: str | None = None
+
+
+async def get_bot_username() -> str:
+    """Имя бота для ссылки t.me/<имя>: один раз спрашиваем у Telegram (get_me)."""
+    global _bot_username
+    if not _bot_username:
+        _bot_username = (await bot.get_me()).username
+    return _bot_username
+
+
+def checkin_note(shift_time: str | None, arrived: datetime) -> str:
+    """Пометка к отметке: «опоздание N мин», «вне графика» (выходной или смены нет)
+    или пусто (пришёл вовремя; формат смены не распознан)."""
+    if shift_time is None:
+        return "вне графика"
+    shift = parse_shift(shift_time)
+    if shift == shifts.DAY_OFF:
+        return "вне графика"
+    if shift is None:
+        return ""
+    start = int(shift[:2]) * 60 + int(shift[3:5])  # «09:00 - 18:00» → минуты от полуночи
+    late = arrived.hour * 60 + arrived.minute - start
+    return f"опоздание {late} мин" if late > 0 else ""
+
+
+async def qr_checkin(message: telebot.types.Message, user, payload: str):
+    """Отметка прихода активного сотрудника по параметру chk_<филиал>_<код>."""
+    user_id = message.from_user.id
+    if not QR_SECRET_KEY:
+        logger.warning("qr: QR_SECRET_KEY не задан, отметка %s не записана", uid_tag(user_id))
+        await bot.send_message(message.chat.id, QR_NOT_SET_TEXT)
+        return
+    parsed = qr.parse_payload(payload)
+    branch_by_code = {c: b for b, c in BRANCH_CODES.items()}
+    branch = branch_by_code.get(parsed[0]) if parsed else None
+    if branch is None:
+        logger.info("qr: код не распознан от %s", uid_tag(user_id))
+        await bot.send_message(message.chat.id, QR_BAD_CODE_TEXT)
+        return
+    branch_code, code = parsed
+    ts = message.date
+    if not qr.verify(QR_SECRET_KEY, branch_code, code, ts):
+        logger.info("qr: устаревший код от %s, филиал %s", uid_tag(user_id), branch_code)
+        await bot.send_message(message.chat.id, QR_EXPIRED_TEXT)
+        return
+    if branch != user['branch']:
+        logger.info("qr: %s сканировал QR чужого филиала %s", uid_tag(user_id), branch_code)
+        await bot.send_message(
+            message.chat.id,
+            f"⛔️ Это QR-код филиала «{esc(branch)}», а вы работаете в филиале «{esc(user['branch'])}». "
+            "Приход не отмечен.",
+            parse_mode="HTML"
+        )
+        return
+
+    arrived = datetime.fromtimestamp(ts)  # местное время сервера, как и «сегодня» в расписании
+    date_str = arrived.date().isoformat()
+    rows = await db.get_user_schedule(user_id, date_str, date_str)
+    note = checkin_note(rows[0]['shift_time'] if rows else None, arrived)
+    earlier = await db.add_attendance(user_id, branch, ts, date_str, note)
+    if earlier is not None:
+        await bot.send_message(message.chat.id, f"ℹ️ Вы уже отметились в {datetime.fromtimestamp(earlier):%H:%M}.")
+        return
+
+    logger.info("qr: приход %s, филиал %s%s", uid_tag(user_id), branch_code, f" ({note})" if note else "")
+    note_line = f"\n⚠️ {esc(note)}" if note else ""
+    await bot.send_message(
+        message.chat.id,
+        f"✅ Пришёл: {arrived:%H:%M}, филиал «{esc(branch)}»{note_line}",
+        parse_mode="HTML"
+    )
+    text = (
+        f"🕘 <b>Отметка прихода</b>\n"
+        f"<b>Сотрудник:</b> {esc(user['full_name'])}\n"
+        f"<b>Время:</b> {arrived:%H:%M}, филиал «{esc(branch)}»{note_line}"
+    )
+    # Те же получатели, что у заявок: руководство филиала, а если его нет — Администраторы
+    for mgr in await db.get_request_recipients(branch, exclude_id=user_id):
+        await _notify(mgr['telegram_id'], text, "QR-отметка", parse_mode="HTML")
+
+
+@bot.message_handler(commands=['qr'])
+async def cmd_qr(message: telebot.types.Message):
+    """Руководителю — текущая ссылка отметки своего филиала, Администратору — всех филиалов."""
+    user = await get_user_with_role(message.from_user.id, MANAGEMENT_ROLES)
+    if not user:
+        return
+    if not QR_SECRET_KEY:
+        await bot.send_message(message.chat.id, "⚠️ Отметка не настроена: впишите QR_SECRET_KEY в .env и перезапустите бота.")
+        return
+    branches = BRANCHES if user['role'] == ROLE_SUPERADMIN else [user['branch']]
+    username = await get_bot_username()
+    now = int(time.time())  # ссылка — на текущую минуту, даже если команда пришла с опозданием
+    parts = []
+    for branch in branches:
+        code = BRANCH_CODES.get(branch)
+        if not code:
+            parts.append(f"🏢 «{esc(branch)}»: для этого филиала нет кода QR.")
+            continue
+        link = qr.make_link(username, qr.make_payload(QR_SECRET_KEY, code, now))
+        parts.append(f"🏢 «{esc(branch)}»:\n{esc(link)}")
+    await bot.send_message(
+        message.chat.id,
+        "📷 <b>Ссылка для отметки прихода</b>\n\n" + "\n\n".join(parts)
+        + f"\n\n⏳ Действует около {QR_VALID_SECONDS} секунд.",
+        parse_mode="HTML"
+    )
 
 # =====================================================================
 # ХЭНДЛЕРЫ РАБОТНИКА
