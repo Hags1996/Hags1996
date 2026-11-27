@@ -49,7 +49,7 @@ USER_INACTIVE = "inactive"  # уволен / отклонён: доступ за
 # Филиал первого Администратора: ему филиал не важен, он выбирает его кнопками
 NO_BRANCH = "—"
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _UPSERT_SHIFT_SQL = (
     "INSERT INTO schedules (user_id, date_str, shift_time) VALUES (?, ?, ?) "
@@ -203,6 +203,22 @@ async def _migrate(db, today: date):
         await db.execute("UPDATE users SET status = ?", (USER_ACTIVE,))
         await db.execute("CREATE INDEX IF NOT EXISTS idx_users_branch_status ON users(branch, status)")
         await db.execute("PRAGMA user_version = 2")
+
+    if version < 3:
+        # Отметки прихода по QR: ts — unix-время сообщения Telegram, date_str — местная дата ГГГГ-ММ-ДД
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS attendance (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                branch TEXT NOT NULL,
+                ts INTEGER NOT NULL,
+                date_str TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(user_id) REFERENCES users(telegram_id)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id, date_str)")
+        await db.execute("PRAGMA user_version = 3")
 
 
 # ---------------------------------------------------------------------
@@ -517,6 +533,48 @@ async def decide_request(req_id: int, approve: bool):
             await db.rollback()
             raise
         return req
+
+
+# ---------------------------------------------------------------------
+# Отметки прихода (QR)
+# ---------------------------------------------------------------------
+async def add_attendance(user_id: int, branch: str, ts: int, date_str: str, note: str) -> int | None:
+    """Отметить приход: одна отметка на сотрудника в день.
+
+    Проверка и запись — в одной транзакции BEGIN IMMEDIATE, поэтому два
+    одновременных скана не дадут двух отметок. Возвращает None, если отметка
+    записана, или ts уже существующей отметки за этот день."""
+    async with _connect() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            async with db.execute(
+                "SELECT ts FROM attendance WHERE user_id = ? AND date_str = ? ORDER BY ts LIMIT 1",
+                (user_id, date_str)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row:
+                await db.rollback()
+                return row[0]
+            await db.execute(
+                "INSERT INTO attendance (user_id, branch, ts, date_str, note) VALUES (?, ?, ?, ?, ?)",
+                (user_id, branch, ts, date_str, note)
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
+        return None
+
+
+async def get_attendance(user_id: int, date_str: str):
+    """Отметки сотрудника за день (по времени)."""
+    async with _connect() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM attendance WHERE user_id = ? AND date_str = ? ORDER BY ts",
+            (user_id, date_str)
+        ) as cursor:
+            return await cursor.fetchall()
 
 
 # ---------------------------------------------------------------------
